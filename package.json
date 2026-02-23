@@ -2,8 +2,7 @@
   "name": "shopify-utms-app",
   "version": "1.0.0",
   "scripts": {
-    "build": "cd web && npm install && cd frontend && npm install && npm run build",
-    "start": "cd web && node index.js",
-    "dev": "cd web && node index.js"
+    "build": "echo done",
+    "start": "cd web && node index.js"
   }
 }
