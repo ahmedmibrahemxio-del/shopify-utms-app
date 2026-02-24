@@ -28,16 +28,27 @@ app.get("/api/orders", async (req, res) => {
 
   try {
     // Date range — default to today
+    // نحول التاريخ لـ UTC عشان نجيب كل أوردرات اليوم بغض النظر عن الـ Timezone
+    const TIMEZONE_OFFSET = parseInt(process.env.TIMEZONE_OFFSET || "2"); // Cairo = +2
     const today   = new Date();
     const dateStr = today.toISOString().split("T")[0];
-    const minDate = `${req.query.date_from || dateStr}T00:00:00`;
-    const maxDate = `${req.query.date_to   || dateStr}T23:59:59`;
+
+    const fromStr = req.query.date_from || dateStr;
+    const toStr   = req.query.date_to   || dateStr;
+
+    // بداية اليوم بتوقيت القاهرة → UTC
+    const minDate = new Date(`${fromStr}T00:00:00`);
+    minDate.setHours(minDate.getHours() - TIMEZONE_OFFSET);
+
+    // نهاية اليوم بتوقيت القاهرة → UTC
+    const maxDate = new Date(`${toStr}T23:59:59`);
+    maxDate.setHours(maxDate.getHours() - TIMEZONE_OFFSET);
 
     let allOrders = [];
     let url = `https://${shop}.myshopify.com/admin/api/2024-01/orders.json`
             + `?status=any&limit=250`
-            + `&created_at_min=${encodeURIComponent(minDate)}`
-            + `&created_at_max=${encodeURIComponent(maxDate)}`
+            + `&created_at_min=${encodeURIComponent(minDate.toISOString())}`
+            + `&created_at_max=${encodeURIComponent(maxDate.toISOString())}`
             + `&fields=id,created_at,line_items,note_attributes,landing_site,total_price,financial_status,customer,shipping_address`;
 
     while (url) {
