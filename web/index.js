@@ -20,24 +20,15 @@ async function getShopifyAccessToken(shop) {
     return cachedToken;
   }
 
-  const clientId = process.env.SHOPIFY_CLIENT_ID;
-  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret) {
-    throw new Error("Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET");
-  }
-
   const response = await fetch(
     `https://${shop}.myshopify.com/admin/oauth/access_token`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         grant_type: "client_credentials",
-        client_id: clientId,
-        client_secret: clientSecret
+        client_id: process.env.SHOPIFY_CLIENT_ID,
+        client_secret: process.env.SHOPIFY_CLIENT_SECRET
       })
     }
   );
@@ -54,14 +45,17 @@ async function getShopifyAccessToken(shop) {
   return cachedToken;
 }
 
-app.use(express.json());
+function safeDecode(value = "") {
+  try {
+    return decodeURIComponent(String(value).replace(/\+/g, " "));
+  } catch {
+    return String(value).replace(/\+/g, " ");
+  }
+}
 
-// Serve React frontend build
+app.use(express.json());
 app.use(express.static(join(__dirname, "frontend/dist")));
 
-// =============================================
-// API: Get Today's Orders
-// =============================================
 app.get("/api/orders", async (req, res) => {
   const shop = req.query.shop || process.env.SHOP_NAME;
 
@@ -72,9 +66,11 @@ app.get("/api/orders", async (req, res) => {
   try {
     const token = await getShopifyAccessToken(shop);
 
-    const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+02:00";
+    const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+03:00";
     const today = new Date();
-    const dateStr = today.toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
+    const dateStr = today.toLocaleDateString("en-CA", {
+      timeZone: "Africa/Cairo"
+    });
 
     const fromStr = req.query.date_from || dateStr;
     const toStr = req.query.date_to || dateStr;
@@ -164,25 +160,21 @@ app.get("/api/orders", async (req, res) => {
       camMap[cam] = (camMap[cam] || 0) + 1;
     });
 
-    const utmSources = Object.entries(utmMap)
-      .map(([source, count]) => ({ source, count }))
-      .sort((a, b) => b.count - a.count);
-
-    const utmCampaigns = Object.entries(camMap)
-      .map(([campaign, count]) => ({ campaign, count }))
-      .sort((a, b) => b.count - a.count);
-
     res.json({
-      date: `${req.query.date_from || dateStr} → ${req.query.date_to || dateStr}`,
-      dateFrom: req.query.date_from || dateStr,
-      dateTo: req.query.date_to || dateStr,
+      date: `${fromStr} → ${toStr}`,
+      dateFrom: fromStr,
+      dateTo: toStr,
       totalOrders: processed.length,
       totalRevenue: totalRevenue.toFixed(2),
       paidOrders,
       orders: processed,
       products,
-      utmSources,
-      utmCampaigns
+      utmSources: Object.entries(utmMap)
+        .map(([source, count]) => ({ source, count }))
+        .sort((a, b) => b.count - a.count),
+      utmCampaigns: Object.entries(camMap)
+        .map(([campaign, count]) => ({ campaign, count }))
+        .sort((a, b) => b.count - a.count)
     });
   } catch (err) {
     console.error(err);
@@ -190,15 +182,12 @@ app.get("/api/orders", async (req, res) => {
   }
 });
 
-// =============================================
-// Helper: Extract UTM
-// =============================================
 function extractUTM(order) {
   const utm = { source: "", medium: "", campaign: "", content: "", term: "" };
 
   for (const attr of order.note_attributes || []) {
     const name = (attr.name || "").toLowerCase();
-    const val = attr.value || "";
+    const val = safeDecode(attr.value || "");
 
     if (name === "utm_source") utm.source = val;
     if (name === "utm_medium") utm.medium = val;
@@ -207,27 +196,26 @@ function extractUTM(order) {
     if (name === "utm_term") utm.term = val;
   }
 
-  if (!utm.source && order.landing_site) {
+  if (order.landing_site) {
     const landing = order.landing_site;
 
     const getParam = (url, param) => {
       const match = url.match(new RegExp(`[?&]${param}=([^&]*)`));
-      return match ? decodeURIComponent(match[1]) : "";
+      return match ? safeDecode(match[1]) : "";
     };
 
-    utm.source = getParam(landing, "utm_source");
-    utm.medium = getParam(landing, "utm_medium");
-    utm.campaign = getParam(landing, "utm_campaign");
-    utm.content = getParam(landing, "utm_content");
-    utm.term = getParam(landing, "utm_term");
+    utm.source = utm.source || getParam(landing, "utm_source");
+    utm.medium = utm.medium || getParam(landing, "utm_medium");
+    utm.campaign = utm.campaign || getParam(landing, "utm_campaign");
+    utm.content = utm.content || getParam(landing, "utm_content");
+    utm.term = utm.term || getParam(landing, "utm_term");
   }
 
   return utm;
 }
 
-// Fallback to React app
-app.get("*", (req, res) => {
-  res.sendFile(join(__dirname, "frontend/dist/index.html"));
+app.use((req, res) => {
+  res.sendFile(join(__dirname, "frontend", "dist", "index.html"));
 });
 
 app.listen(PORT, () => {
