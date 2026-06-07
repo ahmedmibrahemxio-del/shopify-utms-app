@@ -10,6 +10,50 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getShopifyAccessToken(shop) {
+  const now = Date.now();
+
+  if (cachedToken && now < tokenExpiresAt - 5 * 60 * 1000) {
+    return cachedToken;
+  }
+
+  const clientId = process.env.SHOPIFY_CLIENT_ID;
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET");
+  }
+
+  const response = await fetch(
+    `https://${shop}.myshopify.com/admin/oauth/access_token`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        client_id: clientId,
+        client_secret: clientSecret
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(JSON.stringify(data));
+  }
+
+  cachedToken = data.access_token;
+  tokenExpiresAt = Date.now() + ((data.expires_in || 86400) * 1000);
+
+  return cachedToken;
+}
+
 app.use(express.json());
 
 // Serve React frontend build
@@ -19,33 +63,32 @@ app.use(express.static(join(__dirname, "frontend/dist")));
 // API: Get Today's Orders
 // =============================================
 app.get("/api/orders", async (req, res) => {
-  const shop  = req.query.shop  || process.env.SHOP_NAME;
-  const token = process.env.ACCESS_TOKEN;
+  const shop = req.query.shop || process.env.SHOP_NAME;
 
-  if (!shop || !token) {
-    return res.status(400).json({ error: "Missing shop or token" });
+  if (!shop) {
+    return res.status(400).json({ error: "Missing shop" });
   }
 
   try {
-    // Date range — default to today
-    // الحل: نرسل التاريخ مع +02:00 عشان شوبيفاي يفهم التوقيت صح
-    const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+02:00"; // Cairo
-    const today   = new Date();
+    const token = await getShopifyAccessToken(shop);
+
+    const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+02:00";
+    const today = new Date();
     const dateStr = today.toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
 
     const fromStr = req.query.date_from || dateStr;
-    const toStr   = req.query.date_to   || dateStr;
+    const toStr = req.query.date_to || dateStr;
 
-    // نرسل التاريخ مع الـ timezone offset مباشرة لشوبيفاي
     const minDate = `${fromStr}T00:00:00${TIMEZONE_OFFSET}`;
     const maxDate = `${toStr}T23:59:59${TIMEZONE_OFFSET}`;
 
     let allOrders = [];
-    let url = `https://${shop}.myshopify.com/admin/api/2024-01/orders.json`
-            + `?status=any&limit=250`
-            + `&created_at_min=${encodeURIComponent(minDate)}`
-            + `&created_at_max=${encodeURIComponent(maxDate)}`
-            + `&fields=id,created_at,line_items,note_attributes,landing_site,total_price,financial_status,customer,shipping_address`;
+    let url =
+      `https://${shop}.myshopify.com/admin/api/2024-01/orders.json` +
+      `?status=any&limit=250` +
+      `&created_at_min=${encodeURIComponent(minDate)}` +
+      `&created_at_max=${encodeURIComponent(maxDate)}` +
+      `&fields=id,created_at,line_items,note_attributes,landing_site,total_price,financial_status,customer,shipping_address`;
 
     while (url) {
       const response = await fetch(url, {
@@ -60,9 +103,9 @@ app.get("/api/orders", async (req, res) => {
       const data = await response.json();
       allOrders = allOrders.concat(data.orders || []);
 
-      // Pagination
       const linkHeader = response.headers.get("Link") || "";
       url = null;
+
       if (linkHeader.includes('rel="next"')) {
         const parts = linkHeader.split(",");
         for (const part of parts) {
@@ -74,74 +117,73 @@ app.get("/api/orders", async (req, res) => {
       }
     }
 
-    // Sort newest first
     allOrders.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
-    // Process orders
     const processed = allOrders.map(order => ({
-      id:       order.id,
-      shortId:  "#" + String(order.id).slice(-8),
-      date:     order.created_at,
-      status:   order.financial_status,
-      total:    parseFloat(order.total_price || 0),
+      id: order.id,
+      shortId: "#" + String(order.id).slice(-8),
+      date: order.created_at,
+      status: order.financial_status,
+      total: parseFloat(order.total_price || 0),
       customer: order.customer
         ? `${order.customer.first_name || ""} ${order.customer.last_name || ""}`.trim()
         : "—",
-      city:     order.shipping_address?.city    || "—",
-      country:  order.shipping_address?.country || "—",
+      city: order.shipping_address?.city || "—",
+      country: order.shipping_address?.country || "—",
       products: (order.line_items || []).map(i => ({
-        title:    i.title,
+        title: i.title,
         quantity: i.quantity,
-        price:    parseFloat(i.price)
+        price: parseFloat(i.price)
       })),
       utm: extractUTM(order)
     }));
 
-    // Stats
-    const totalRevenue  = processed.reduce((s, o) => s + o.total, 0);
-    const paidOrders    = processed.filter(o => o.status === "paid").length;
+    const totalRevenue = processed.reduce((s, o) => s + o.total, 0);
+    const paidOrders = processed.filter(o => o.status === "paid").length;
 
-    // Product counts
     const productMap = {};
     processed.forEach(order => {
       order.products.forEach(p => {
         if (!productMap[p.title]) productMap[p.title] = { units: 0, revenue: 0 };
-        productMap[p.title].units   += p.quantity;
+        productMap[p.title].units += p.quantity;
         productMap[p.title].revenue += p.price * p.quantity;
       });
     });
+
     const products = Object.entries(productMap)
       .map(([name, data]) => ({ name, ...data }))
       .sort((a, b) => b.units - a.units);
 
-    // UTM summary
-    const utmMap = {}, camMap = {};
+    const utmMap = {};
+    const camMap = {};
+
     processed.forEach(order => {
-      const src = order.utm.source   || "(غير محدد)";
+      const src = order.utm.source || "(غير محدد)";
       const cam = order.utm.campaign || "(غير محدد)";
       utmMap[src] = (utmMap[src] || 0) + 1;
       camMap[cam] = (camMap[cam] || 0) + 1;
     });
+
     const utmSources = Object.entries(utmMap)
       .map(([source, count]) => ({ source, count }))
       .sort((a, b) => b.count - a.count);
+
     const utmCampaigns = Object.entries(camMap)
       .map(([campaign, count]) => ({ campaign, count }))
       .sort((a, b) => b.count - a.count);
 
     res.json({
-      date:         `${req.query.date_from || dateStr} → ${req.query.date_to || dateStr}`,
-      dateFrom:     req.query.date_from || dateStr,
-      dateTo:       req.query.date_to   || dateStr,
-      totalOrders:  processed.length,
+      date: `${req.query.date_from || dateStr} → ${req.query.date_to || dateStr}`,
+      dateFrom: req.query.date_from || dateStr,
+      dateTo: req.query.date_to || dateStr,
+      totalOrders: processed.length,
       totalRevenue: totalRevenue.toFixed(2),
       paidOrders,
-      orders:       processed,
+      orders: processed,
       products,
       utmSources,
       utmCampaigns
     });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -154,29 +196,30 @@ app.get("/api/orders", async (req, res) => {
 function extractUTM(order) {
   const utm = { source: "", medium: "", campaign: "", content: "", term: "" };
 
-  // From note_attributes
-  for (const attr of (order.note_attributes || [])) {
+  for (const attr of order.note_attributes || []) {
     const name = (attr.name || "").toLowerCase();
-    const val  = attr.value || "";
-    if (name === "utm_source")   utm.source   = val;
-    if (name === "utm_medium")   utm.medium   = val;
+    const val = attr.value || "";
+
+    if (name === "utm_source") utm.source = val;
+    if (name === "utm_medium") utm.medium = val;
     if (name === "utm_campaign") utm.campaign = val;
-    if (name === "utm_content")  utm.content  = val;
-    if (name === "utm_term")     utm.term     = val;
+    if (name === "utm_content") utm.content = val;
+    if (name === "utm_term") utm.term = val;
   }
 
-  // From landing_site URL
   if (!utm.source && order.landing_site) {
     const landing = order.landing_site;
+
     const getParam = (url, param) => {
       const match = url.match(new RegExp(`[?&]${param}=([^&]*)`));
       return match ? decodeURIComponent(match[1]) : "";
     };
-    utm.source   = getParam(landing, "utm_source");
-    utm.medium   = getParam(landing, "utm_medium");
+
+    utm.source = getParam(landing, "utm_source");
+    utm.medium = getParam(landing, "utm_medium");
     utm.campaign = getParam(landing, "utm_campaign");
-    utm.content  = getParam(landing, "utm_content");
-    utm.term     = getParam(landing, "utm_term");
+    utm.content = getParam(landing, "utm_content");
+    utm.term = getParam(landing, "utm_term");
   }
 
   return utm;
