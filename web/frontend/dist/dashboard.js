@@ -8,7 +8,7 @@
     from: new Date().toISOString().slice(0, 10),
     to: new Date().toISOString().slice(0, 10),
     source: "", campaign: "", product: "", search: "", level: "campaign",
-    selectedProduct: null, refreshedAt: null, sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
+    selectedProduct: null, refreshedAt: null, page: 0, presetKey: "today", sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
   };
   const labels = {
     overview: "نظرة عامة", campaigns: "أداء الحملات",
@@ -37,6 +37,7 @@
     start.setDate(end.getDate() - days + 1);
     state.from = iso(start);
     state.to = iso(end);
+    state.page = 0;
     load();
   }
   function currentOrders() {
@@ -94,22 +95,26 @@
     }).join("") + '</div>';
   }
   function overview() {
-    const d = state.data, total = d.totalOrders || 0;
-    const coverage = d.utmCoverage || {};
+    const d = state.data, total = d.totalOrders || 0, coverage = d.utmCoverage || {};
+    const topSource = (d.utmSources || []).find(x => x.source !== "(غير محدد)");
     return '<section class="metric-grid">' +
       metric("إجمالي الأوردرات", num(total), "خلال الفترة المختارة", "▤", "blue") +
-      metric("قيمة الطلبات", money(d.totalRevenue), "قيمة الأوردرات وليست التحصيل", "￡", "teal") +
-      metric("أوردرات مدفوعة", num(d.paidOrders), pct(d.paidOrders, total) + " من الأوردرات", "✓", "green") +
-      metric("UTM Coverage", pct(coverage.tracked, coverage.total), num(coverage.tracked || 0) +
-        " أوردر له UTM من " + num(coverage.total || 0), "↗", "purple") +
-      '</section><div class="two-panels">' +
-      '<section class="panel"><div class="panel-heading"><div><span class="eyebrow">PRODUCT INSIGHTS</span>' +
-      '<h2>أكثر المنتجات مبيعًا</h2></div><button class="text-link" data-view="products">كل المنتجات ←</button></div>' +
-      (d.products.length ? '<div class="products-compact">' + d.products.slice(0, 7).map((p, i) =>
-        '<button class="product-mini" data-product="' + safe(p.key) + '"><span class="product-number">' +
-        (i + 1) + '</span><span class="product-name">' + safe(p.name) + '</span><span class="product-qty">' +
-        num(p.units) + ' وحدة</span></button>').join("") + '</div>' : empty()) + '</section>' +
-      '<section class="panel"><div class="panel-heading"><div><span class="eyebrow">ATTRIBUTION</span><h2>مصادر الزيارات</h2></div></div>' +
+      metric("قيمة الطلبات", money(d.totalRevenue), "قيمة الأوردرات، مش المحصّل", "↗", "teal") +
+      metric("الأوردرات المدفوعة", num(d.paidOrders), pct(d.paidOrders, total) + " من إجمالي الطلبات", "✓", "green") +
+      metric("تغطية UTM", pct(coverage.tracked, coverage.total),
+      num(coverage.tracked || 0) + " من " + num(coverage.total || 0) + " أوردر", "◎", "purple") +
+      '</section><section class="overview-lead"><div><strong>اعرف المصدر الحقيقي لكل أوردر</strong><p>' +
+      (topSource ? 'أعلى مصدر مسجل: ' + safe(topSource.source) + ' • ' + num(topSource.count) + ' أوردر' :
+      'راقب الحملات والمحتويات من بيانات Shopify المسجلة') + '</p></div>' +
+      '<button data-view="campaigns">تحليل الحملات ←</button></section><div class="two-panels">' +
+      '<section class="panel"><div class="panel-heading"><div><span class="eyebrow">TOP PRODUCTS</span><h2>المنتجات الأكثر طلبًا</h2>' +
+      '<p>مرتبة حسب الوحدات</p></div><button class="text-link" data-view="products">كل المنتجات ←</button></div>' +
+      (d.products.length ? '<div class="products-compact">' + d.products.slice(0, 7).map((p,i) =>
+      '<button class="product-mini" data-product="' + safe(p.key) + '"><span class="product-number">' +
+      (i + 1) + '</span><span class="product-name" title="' + safe(p.name) + '">' + safe(p.name) +
+      '</span><span class="product-qty">' + num(p.units) + ' وحدة</span></button>').join("") : empty()) +
+      '</section><section class="panel"><div class="panel-heading"><div><span class="eyebrow">ATTRIBUTION</span>' +
+      '<h2>مصادر الأوردرات</h2><p>النسب من إجمالي الأوردرات</p></div></div>' +
       barRows(d.utmSources || [], total, "source") +
       '<div class="panel-separator"></div><div class="panel-heading compact"><h2>الحملات الأعلى</h2>' +
       '<button class="text-link" data-view="campaigns">التفاصيل ←</button></div>' +
@@ -132,12 +137,19 @@
       '<button class="clear-button" data-action="reset-filters">مسح الفلاتر</button></section>';
   }
   function table(headers, rows, cols) {
-    if (!rows.length) return empty("مفيش أوردرات أو حملات مطابقة للفلاتر.");
+    if (!rows.length) return empty("مفيش نتائج مطابقة. جرّب تغيير الفلاتر أو الفترة.");
+    const limit = 20, maxPage = Math.max(0, Math.ceil(rows.length / limit) - 1);
+    const page = Math.min(state.page, maxPage), start = page * limit;
     return '<div class="table-scroll"><table><thead><tr>' +
-      headers.map(h => '<th>' + safe(h) + '</th>').join("") + '</tr></thead><tbody>' +
-      rows.map(row => '<tr>' + row.map((cell, i) => '<td' +
-        (cols && cols[i] ? ' class="' + cols[i] + '"' : '') + '>' + cell + '</td>').join("") +
-      '</tr>').join("") + '</tbody></table></div>';
+      headers.map(h => '<th scope="col">' + safe(h) + '</th>').join("") + '</tr></thead><tbody>' +
+      rows.slice(start, start + limit).map(row => '<tr>' + row.map((cell, i) => '<td' +
+      (cols && cols[i] ? ' class="' + cols[i] + '"' : '') + '>' + cell + '</td>').join("") +
+      '</tr>').join("") + '</tbody></table></div>' +
+      '<div class="table-footer"><span>عرض ' + num(start + 1) + '–' +
+      num(Math.min(start + limit, rows.length)) + ' من ' + num(rows.length) + '</span>' +
+      '<div class="pager"><button data-page="-1" ' + (page === 0 ? 'disabled' : '') +
+      '>السابق</button><span>صفحة ' + (page + 1) + ' من ' + (maxPage + 1) +
+      '</span><button data-page="1" ' + (page === maxPage ? 'disabled' : '') + '>التالي</button></div></div>';
   }
   function campaigns() {
     const orders = currentOrders(), data = aggregate(orders, state.level);
@@ -254,12 +266,13 @@
   }
   function loginPage() {
     return '<div class="login-backdrop"><section class="login-card"><div class="brand-icon">UT</div>' +
-      '<h2>تسجيل الدخول إلى UTM Track</h2><p>اكتب كلمة المرور الخاصة بالـDashboard لعرض بيانات الأوردرات.</p>' +
-      '<form id="login-form"><label for="dashboard-password">كلمة المرور</label>' +
-      '<input id="dashboard-password" type="password" autocomplete="current-password" required />' +
-      (state.loginError ? '<div class="inline-error">' + safe(state.loginError) + '</div>' : '') +
-      '<button class="primary-button" type="submit" ' + (state.busy ? "disabled" : "") + '>دخول آمن</button></form>' +
-      '</section></div>';
+      '<h2>أهلًا بيك في UTM Track</h2><p>كل أوردرات Shopify وتحليل الحملات في مكان واحد. أدخل كلمة المرور الخاصة بالـDashboard.</p>' +
+      '<form id="login-form"><label for="dashboard-password">كلمة مرور لوحة التحكم</label>' +
+      '<input id="dashboard-password" type="password" autocomplete="current-password" required placeholder="••••••••" />' +
+      (state.loginError ? '<div class="inline-error" role="alert">' + safe(state.loginError) + '</div>' : '') +
+      '<button class="primary-button" type="submit" ' + (state.busy ? "disabled" : "") + '>' +
+      (state.busy ? "جاري الدخول…" : "تسجيل الدخول ←") + '</button></form>' +
+      '<div class="login-footnote">جلسة خاصة لحماية بيانات الطلبات</div></section></div>';
   }
   async function login(password) {
     if (state.busy) return;
@@ -288,38 +301,51 @@
   }
   function render() {
     if (!root) return;
+    if (!state.sessionToken) { root.innerHTML = loginPage(); return; }
+    const viewName = labels[state.view] || labels.overview;
+    const nav = Object.keys(labels).map(k => '<button class="nav-item ' +
+      (state.view === k ? "active" : "") + '" data-view="' + k + '"' +
+      (state.view === k ? ' aria-current="page"' : '') + '><span class="nav-icon">' +
+      icon[k] + '</span><span>' + labels[k] + '</span></button>').join("");
     let body = "";
     if (!state.data) {
-      body = state.error ? '<div class="error-screen"><b>تعذر تحميل البيانات</b><p>' +
+      body = state.error ? '<div class="error-screen" role="alert"><b>تعذر تحميل البيانات</b><p>' +
         safe(state.error) + '</p><button data-action="retry" class="primary-button">إعادة المحاولة</button></div>' :
-        '<div class="loading-screen"><div class="spinner"></div><p>جاري تحميل Dashboard...</p></div>';
+        '<div class="loading-screen" role="status"><div class="spinner"></div><p>جاري جلب الأوردرات من Shopify...</p></div>';
     } else {
-      body = '<nav class="tabs" aria-label="صفحات Dashboard">' +
-        Object.keys(labels).map(k => '<button data-view="' + k + '" class="' +
-        (state.view === k ? "active" : "") + '">' + icon[k] + ' ' + labels[k] + '</button>').join("") +
-        '</nav><main>' + (state.view === "overview" ? overview() : state.view === "campaigns" ?
-        campaigns() : state.view === "orders" ? orders() :
-        state.view === "products" ? productCards() : utmTable()) + '</main>' +
-        productModal();
+      body = '<main id="main-content">' +
+        (state.view === "overview" ? overview() : state.view === "campaigns" ? campaigns() :
+        state.view === "orders" ? orders() : state.view === "products" ? productCards() : utmTable()) +
+        '</main>' + productModal();
     }
-    if (!state.sessionToken) { root.innerHTML = loginPage(); return; }
-    root.innerHTML = '<div class="app-shell"><header class="topbar">' +
-      '<div class="identity"><div class="brand-icon">UT</div><div><h1>UTM Track</h1><span>Shopify Orders Intelligence</span></div></div>' +
-      '<div class="header-right"><span class="secure-pill">● متجر موثّق</span><button class="refresh-button" data-action="retry" ' +
-      (state.busy ? "disabled" : "") + '>↻ تحديث</button></div></header>' +
-      '<div class="body-shell"><div class="page-heading"><div><div class="eyebrow">ORDERS ANALYTICS</div>' +
-      '<h2>Dashboard <span>الأوردرات والحملات</span></h2><p>راقب الأوردرات ومصادرها من مكان واحد.</p></div>' +
-      '<div class="last-updated">' + (state.refreshedAt ? "آخر تحديث: " + safe(dt(state.refreshedAt)) : "بيانات Shopify") +
-      '</div></div>' +
-      '<section class="date-panel"><div class="date-group"><label>من تاريخ<input type="date" id="date-from" value="' +
-      safe(state.from) + '" /></label><label>إلى تاريخ<input type="date" id="date-to" value="' +
-      safe(state.to) + '" /></label><button class="primary-button" data-action="search">بحث ←</button></div>' +
-      '<div class="presets"><button data-days="1">النهارده</button><button data-days="1" data-yesterday="true">أمس</button>' +
-      '<button data-days="7">7 أيام</button><button data-days="30">30 يوم</button></div></section>' +
-      (state.error && state.data ? '<div class="inline-error">' + safe(state.error) + '</div>' : '') +
-      (state.busy ? '<div class="progress"></div>' : '') + body +
-      '<footer><span>UTM Track • Private Shopify Dashboard</span><span>Order Value ≠ Collected Revenue</span></footer>' +
-      '</div></div>';
+    const active = key => state.presetKey === key ? "active" : "";
+    root.innerHTML = '<div class="app-shell"><aside class="sidebar">' +
+      '<div class="side-brand"><div class="brand-icon">UT</div><div><h1>UTM Track</h1><p>STORE ANALYTICS</p></div></div>' +
+      '<div class="nav-section-title">WORKSPACE</div><nav class="sidebar-nav" aria-label="أقسام لوحة التحكم">' +
+      nav + '</nav><div class="sidebar-bottom"><div class="sidebar-hint"><i></i>' +
+      '<span>لوحة خاصة بمتجرك</span></div><button class="logout-button" data-action="logout">↩ تسجيل الخروج</button>' +
+      '</div></aside><div class="workspace"><header class="topbar"><div class="crumb">' +
+      '<span>لوحة التحكم</span><span class="chevron">/</span><strong>' + safe(viewName) + '</strong></div>' +
+      '<div class="header-right"><span class="secure-pill"><span class="dot"></span>جلسة خاصة</span>' +
+      '<button class="refresh-button" data-action="retry"' + (state.busy ? " disabled" : "") + '>↻ تحديث البيانات</button>' +
+      '</div></header><div class="body-shell"><div class="page-heading"><div>' +
+      '<span class="eyebrow">SHOPIFY INTELLIGENCE</span><h2>' +
+      (state.view === "overview" ? 'كل اللي محتاج تعرفه <span>عن أوردراتك</span>' : safe(viewName)) +
+      '</h2><p>أوردرات Shopify ومصادر الزيارات والحملات للفترة المختارة.</p></div>' +
+      '<span class="last-updated">' + (state.refreshedAt ?
+      'آخر تحديث: ' + safe(dt(state.refreshedAt)) : 'في انتظار البيانات') + '</span></div>' +
+      '<section class="date-panel"><div class="date-group">' +
+      '<label for="date-from">من تاريخ<input type="date" id="date-from" value="' + safe(state.from) + '" /></label>' +
+      '<label for="date-to">إلى تاريخ<input type="date" id="date-to" value="' + safe(state.to) + '" /></label>' +
+      '<button class="primary-button" data-action="search">تطبيق الفترة ←</button></div>' +
+      '<div class="presets"><button data-days="1" data-preset="today" class="' + active("today") + '">النهارده</button>' +
+      '<button data-days="1" data-yesterday="true" data-preset="yesterday" class="' + active("yesterday") + '">أمس</button>' +
+      '<button data-days="7" data-preset="last7" class="' + active("last7") + '">7 أيام</button>' +
+      '<button data-days="30" data-preset="last30" class="' + active("last30") + '">30 يوم</button></div></section>' +
+      (state.error && state.data ? '<div class="inline-error" role="alert">' + safe(state.error) + '</div>' : '') +
+      (state.busy ? '<div class="progress" role="status"></div>' : '') +
+      body + '<footer><span>UTM Track · Private analytics</span><span>قيمة الطلبات ليست بالضرورة المبيعات المحصّلة</span></footer>' +
+      '</div></div></div>';
   }
   async function load() {
     if (state.busy) return;
@@ -353,6 +379,18 @@
       render();
     }
   }
+  async function logout() {
+    const token = state.sessionToken;
+    state.sessionToken = "";
+    state.data = null;
+    state.error = "";
+    sessionStorage.removeItem("utm_track_session");
+    render();
+    try {
+      await fetch("/api/logout", {method:"POST",headers:{Authorization:"Bearer " + token},cache:"no-store"});
+    } catch { /* Still logged out of the browser */ }
+  }
+
   function exportCampaigns() {
     const values = [["Source","Campaign","Content","Orders","Order Value","Paid Orders","Units"]];
     aggregate(currentOrders(), state.level).forEach(g =>
@@ -377,37 +415,39 @@
     if (event.target.classList.contains("modal-backdrop")) {
       state.selectedProduct = null; render(); return;
     }
-    const el = event.target.closest("[data-action],[data-view],[data-days],[data-level],[data-product]");
+    const el = event.target.closest("[data-action],[data-view],[data-days],[data-level],[data-product],[data-page]");
     if (!el) return;
     if (el.dataset.view) {
-      state.view = el.dataset.view; state.selectedProduct = null; render(); return;
+      state.view = el.dataset.view; state.selectedProduct = null; state.page = 0; render(); return;
     }
-    if (el.dataset.days) { preset(Number(el.dataset.days), el.dataset.yesterday === "true"); return; }
-    if (el.dataset.level) { state.level = el.dataset.level; render(); return; }
+    if (el.dataset.days) { state.presetKey = el.dataset.preset || ""; preset(Number(el.dataset.days), el.dataset.yesterday === "true"); return; }
+    if (el.dataset.page) { state.page = Math.max(0, state.page + Number(el.dataset.page)); render(); return; }
+    if (el.dataset.level) { state.level = el.dataset.level; state.page = 0; render(); return; }
     if (el.dataset.product) { state.selectedProduct = el.dataset.product; render(); return; }
     switch (el.dataset.action) {
       case "retry": load(); break;
+      case "logout": logout(); break;
       case "search": {
         const from = $("#date-from")?.value, to = $("#date-to")?.value;
         if (!from || !to || from > to) {
           state.error = "اتأكد إن تاريخ البداية قبل تاريخ النهاية."; render(); return;
         }
-        state.from = from; state.to = to; load(); break;
+        state.from = from; state.to = to; state.presetKey = ""; state.page = 0; load(); break;
       }
       case "reset-filters":
-        state.source = ""; state.campaign = ""; state.product = ""; state.search = ""; render(); break;
+        state.source = ""; state.campaign = ""; state.product = ""; state.search = ""; state.page = 0; render(); break;
       case "export-campaigns": exportCampaigns(); break;
       case "close-modal": state.selectedProduct = null; render(); break;
     }
   });
   root.addEventListener("change", (event) => {
     const k = event.target?.dataset?.filter;
-    if (k && Object.prototype.hasOwnProperty.call(state,k)) { state[k] = event.target.value; render(); }
+    if (k && Object.prototype.hasOwnProperty.call(state,k)) { state[k] = event.target.value; state.page = 0; render(); }
   });
   root.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && state.selectedProduct) { state.selectedProduct = null; render(); }
     if (event.key === "Enter" && event.target?.id === "search") {
-      state.search = event.target.value; render();
+      state.search = event.target.value; state.page = 0; render();
     }
   });
   render();
