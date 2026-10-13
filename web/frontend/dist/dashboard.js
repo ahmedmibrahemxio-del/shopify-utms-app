@@ -8,7 +8,7 @@
     from: new Date().toISOString().slice(0, 10),
     to: new Date().toISOString().slice(0, 10),
     source: "", campaign: "", product: "", search: "", level: "campaign",
-    selectedProduct: null, refreshedAt: null, page: 0, presetKey: "today", sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
+    selectedProduct: null, refreshedAt: null, page: 0, presetKey: "today", productSearch: "", productSort: "orders", productPage: 0, sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
   };
   const labels = {
     overview: "نظرة عامة", campaigns: "أداء الحملات",
@@ -38,6 +38,7 @@
     state.from = iso(start);
     state.to = iso(end);
     state.page = 0;
+    state.productPage = 0;
     load();
   }
   function currentOrders() {
@@ -112,7 +113,7 @@
       (d.products.length ? '<div class="products-compact">' + d.products.slice(0, 7).map((p,i) =>
       '<button class="product-mini" data-product="' + safe(p.key) + '"><span class="product-number">' +
       (i + 1) + '</span><span class="product-name" title="' + safe(p.name) + '">' + safe(p.name) +
-      '</span><span class="product-qty">' + num(p.units) + ' وحدة</span></button>').join("") : empty()) +
+      '</span><span class="product-qty">' + num(p.orders || 0) + ' أوردر • ' + num(p.units) + ' وحدة</span></button>').join("") : empty()) +
       '</section><section class="panel"><div class="panel-heading"><div><span class="eyebrow">ATTRIBUTION</span>' +
       '<h2>مصادر الأوردرات</h2><p>النسب من إجمالي الأوردرات</p></div></div>' +
       barRows(d.utmSources || [], total, "source") +
@@ -204,26 +205,77 @@
       '<section class="panel">' + orderTable(filtered) + '</section>';
   }
   function productCards() {
-    const d = state.data, list = state.source || state.campaign || state.search ?
-      (() => {
-        const m = new Map();
-        currentOrders().forEach(o => o.products.forEach(p => {
-          const row = m.get(p.key) || {key:p.key,name:p.title,units:0,revenue:0};
-          row.units += Number(p.quantity || 0);
-          row.revenue += Number(p.quantity || 0) * Number(p.price || 0);
-          m.set(p.key, row);
-        }));
-        return [...m.values()].sort((a,b) => b.units - a.units);
-      })() : d.products;
-    return '<div class="section-intro"><div><span class="eyebrow">PRODUCT INSIGHTS</span><h2>تحليل المنتجات</h2>' +
-      '<p>التجميع باستخدام Product ID لمنع دمج منتجات مختلفة بنفس الاسم.</p></div></div>' +
-      '<div class="cards-grid">' + (list.length ? list.map(p =>
-        '<button class="product-card" data-product="' + safe(p.key) +
-        '"><div class="product-card-head"><span>◈ المنتج</span><span>↗</span></div>' +
-        '<strong>' + safe(p.name) + '</strong><div class="product-stats"><span><b>' +
-        num(p.units) + '</b> وحدة</span><span><b>' + money(p.revenue) +
-        '</b> قيمة الأصناف</span></div></button>').join("") : empty()) + '</div>';
+    const d = state.data, all = d.products || [];
+    const term = state.productSearch.trim().toLocaleLowerCase("ar");
+    const matched = all.filter(p => !term || String(p.name || "").toLocaleLowerCase("ar").includes(term));
+    const products = [...matched].sort((a,b) => {
+      const k = state.productSort === "units" ? "units" : state.productSort === "revenue" ? "revenue" : "orders";
+      return Number(b[k] || 0) - Number(a[k] || 0) || Number(b.orders || 0) - Number(a.orders || 0);
+    });
+    const totalUnits = all.reduce((sum,p) => sum + Number(p.units || 0),0);
+    const totalValue = all.reduce((sum,p) => sum + Number(p.revenue || 0),0);
+    const perPage = 18, lastPage = Math.max(0,Math.ceil(products.length/perPage)-1);
+    const page = Math.min(state.productPage,lastPage), offset = page * perPage;
+    const cards = products.slice(offset,offset+perPage).map((p,index) =>
+      '<button type="button" class="product-card product-card-enhanced" data-product="' + safe(p.key) +
+      '" aria-label="تفاصيل ' + safe(p.name) + '">' +
+      '<div class="product-card-top"><span class="product-rank">#' + num(offset + index + 1) +
+      '</span><span class="product-card-link">تفاصيل المنتج ↗</span></div>' +
+      '<strong class="product-card-title" title="' + safe(p.name) + '">' + safe(p.name) + '</strong>' +
+      '<div class="product-order-block"><span class="metric-kicker">عدد الأوردرات</span>' +
+      '<div class="product-main-number"><b>' + num(p.orders || 0) + '</b><span>أوردر</span></div></div>' +
+      '<div class="product-card-bottom">' +
+      '<div class="product-card-metric product-units-metric"><span>الوحدات المباعة</span>' +
+      '<strong>' + num(p.units) + '</strong><small>وحدة</small></div>' +
+      '<div class="product-card-metric product-revenue-metric"><span>قيمة الأصناف</span>' +
+      '<strong>' + money(p.revenue) + '</strong><small>إجمالي قيمة الأصناف</small></div></div></button>'
+    ).join("");
+    const summary = '<div class="product-summary-grid">' +
+      '<div class="product-summary-item product-summary-primary"><span class="summary-label">إجمالي الأوردرات</span>' +
+      '<strong>' + num(d.totalOrders || 0) + '</strong><small>أوردر مختلف في الفترة</small></div>' +
+      '<div class="product-summary-item"><span class="summary-label">عدد المنتجات</span>' +
+      '<strong>' + num(all.length) + '</strong><small>منتج عليه مبيعات</small></div>' +
+      '<div class="product-summary-item product-summary-unit"><span class="summary-label">إجمالي الوحدات</span>' +
+      '<strong>' + num(totalUnits) + '</strong><small>وحدة مباعة</small></div>' +
+      '<div class="product-summary-item product-summary-value"><span class="summary-label">قيمة الأصناف</span>' +
+      '<strong>' + money(totalValue) + '</strong><small>مش صافي ربح أو تحصيل</small></div></div>';
+    const sortOptions = [
+      {id:"orders",name:"أعلى عدد أوردرات"},
+      {id:"units",name:"أعلى عدد وحدات"},
+      {id:"revenue",name:"أعلى قيمة أصناف"}
+    ].map(x => '<option value="' + x.id + '"' + (state.productSort === x.id ? ' selected' : '') +
+      '>' + x.name + '</option>').join("");
+    const toolbar = '<div class="product-toolbar"><div class="product-toolbar-title">' +
+      '<span class="eyebrow">PRODUCT PERFORMANCE</span><h3>تفاصيل المنتجات</h3>' +
+      '<p>مرتبة حسب مبيعات الفترة. اضغط أي منتج لتشوف حملاته وأوردراته.</p></div>' +
+      '<form id="products-search-form" class="product-search" role="search">' +
+      '<label class="visually-hidden" for="product-search-input">بحث باسم المنتج</label>' +
+      '<span class="search-glyph" aria-hidden="true">⌕</span>' +
+      '<input id="product-search-input" type="search" placeholder="ابحث باسم المنتج" autocomplete="off" value="' +
+      safe(state.productSearch) + '" /><button type="submit" class="product-search-submit">بحث</button></form>' +
+      '<div class="product-sort-box"><label for="product-sort">ترتيب حسب</label>' +
+      '<select id="product-sort" data-product-sort="true">' + sortOptions + '</select></div></div>';
+    const pager = products.length > perPage ?
+      '<div class="product-pages"><span>عرض ' + num(offset + 1) + '–' +
+      num(Math.min(offset + perPage,products.length)) + ' من ' + num(products.length) +
+      ' منتج</span><div class="pager"><button data-product-page="-1"' +
+      (page===0?' disabled':'') + '>السابق</button><span>صفحة ' + num(page+1) +
+      ' من ' + num(lastPage+1) + '</span><button data-product-page="1"' +
+      (page>=lastPage?' disabled':'') + '>التالي</button></div></div>' : '';
+    return '<div class="products-view"><div class="products-intro"><div><span class="eyebrow">PRODUCT INSIGHTS</span>' +
+      '<h2>تحليل المنتجات</h2><p>عدد الأوردرات الفعلية لكل منتج، بجانب الوحدات وقيمة الأصناف.</p></div>' +
+      '<div class="product-legend"><span><i class="legend-dot orders"></i>الأوردرات</span>' +
+      '<span><i class="legend-dot units"></i>الوحدات</span>' +
+      '<span><i class="legend-dot revenue"></i>قيمة الأصناف</span></div></div>' +
+      summary + toolbar + '<div class="product-results-meta"><span>' + num(products.length) +
+      ' منتج ' + (term?'مطابق للبحث':'خلال الفترة') + '</span>' +
+      (term?'<button type="button" data-action="clear-product-search">مسح البحث ×</button>':'') +
+      '</div>' + (products.length ? '<div class="cards-grid products-grid">' + cards + '</div>' :
+      '<div class="products-empty">' + empty('جرّب اسم منتج تاني أو امسح البحث.') +
+      '<button type="button" class="clear-button" data-action="clear-product-search">عرض كل المنتجات</button></div>') +
+      pager + '</div>';
   }
+
   function utmTable() {
     const filtered = currentOrders();
     const rows = filtered.map(o => [
@@ -407,6 +459,13 @@
     URL.revokeObjectURL(a.href);
   }
   root.addEventListener("submit", event => {
+    if (event.target?.id === "products-search-form") {
+      event.preventDefault();
+      state.productSearch = event.target.querySelector("#product-search-input").value.trim();
+      state.productPage = 0;
+      render();
+      return;
+    }
     if (event.target?.id !== "login-form") return;
     event.preventDefault();
     login(event.target.querySelector("#dashboard-password").value);
@@ -415,13 +474,14 @@
     if (event.target.classList.contains("modal-backdrop")) {
       state.selectedProduct = null; render(); return;
     }
-    const el = event.target.closest("[data-action],[data-view],[data-days],[data-level],[data-product],[data-page]");
+    const el = event.target.closest("[data-action],[data-view],[data-days],[data-level],[data-product],[data-page],[data-product-page]");
     if (!el) return;
     if (el.dataset.view) {
-      state.view = el.dataset.view; state.selectedProduct = null; state.page = 0; render(); return;
+      state.view = el.dataset.view; state.selectedProduct = null; state.page = 0; state.productPage = 0; render(); return;
     }
     if (el.dataset.days) { state.presetKey = el.dataset.preset || ""; preset(Number(el.dataset.days), el.dataset.yesterday === "true"); return; }
     if (el.dataset.page) { state.page = Math.max(0, state.page + Number(el.dataset.page)); render(); return; }
+    if (el.dataset.productPage) { state.productPage = Math.max(0, state.productPage + Number(el.dataset.productPage)); render(); return; }
     if (el.dataset.level) { state.level = el.dataset.level; state.page = 0; render(); return; }
     if (el.dataset.product) { state.selectedProduct = el.dataset.product; render(); return; }
     switch (el.dataset.action) {
@@ -432,15 +492,22 @@
         if (!from || !to || from > to) {
           state.error = "اتأكد إن تاريخ البداية قبل تاريخ النهاية."; render(); return;
         }
-        state.from = from; state.to = to; state.presetKey = ""; state.page = 0; load(); break;
+        state.from = from; state.to = to; state.presetKey = ""; state.page = 0; state.productPage = 0; load(); break;
       }
       case "reset-filters":
         state.source = ""; state.campaign = ""; state.product = ""; state.search = ""; state.page = 0; render(); break;
+      case "clear-product-search": state.productSearch = ""; state.productPage = 0; render(); break;
       case "export-campaigns": exportCampaigns(); break;
       case "close-modal": state.selectedProduct = null; render(); break;
     }
   });
   root.addEventListener("change", (event) => {
+    if (event.target?.dataset?.productSort) {
+      state.productSort = event.target.value;
+      state.productPage = 0;
+      render();
+      return;
+    }
     const k = event.target?.dataset?.filter;
     if (k && Object.prototype.hasOwnProperty.call(state,k)) { state[k] = event.target.value; state.page = 0; render(); }
   });
