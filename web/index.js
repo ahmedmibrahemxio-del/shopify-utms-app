@@ -3,6 +3,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 dotenv.config();
 
@@ -54,10 +55,64 @@ function safeDecode(value = "") {
 }
 
 app.use(express.json());
+
+// Enforce Shopify embedded session authentication for all order data.
+function verifyShopifySession(req, res, next) {
+  const authorization = req.headers.authorization || "";
+  if (!authorization.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "افتح التطبيق من داخل Shopify Admin." });
+  }
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
+  const apiKey = process.env.SHOPIFY_CLIENT_ID;
+  const expectedShop = (process.env.SHOP_NAME || "").replace(/\.myshopify\.com$/i, "").toLowerCase();
+  if (!secret || !apiKey || !expectedShop) {
+    return res.status(503).json({ error: "إعدادات توثيق Shopify غير مكتملة على الخادم." });
+  }
+  try {
+    const parts = authorization.slice(7).split(".");
+    if (parts.length !== 3) throw new Error("invalid token");
+    const decode = s => JSON.parse(Buffer.from(s, "base64url").toString("utf8"));
+    const header = decode(parts[0]);
+    if (header.alg !== "HS256") throw new Error("unsupported algorithm");
+    const signature = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
+    const provided = Buffer.from(parts[2], "base64url");
+    if (signature.length !== provided.length || !timingSafeEqual(signature, provided)) {
+      throw new Error("invalid signature");
+    }
+    const payload = decode(parts[1]);
+    const now = Math.floor(Date.now() / 1000);
+    const dest = new URL(payload.dest || "");
+    if (dest.protocol !== "https:" ||
+        dest.hostname.toLowerCase() !== expectedShop + ".myshopify.com" ||
+        payload.aud !== apiKey ||
+        !Number.isFinite(payload.exp) || payload.exp <= now ||
+        (payload.nbf !== undefined && payload.nbf > now + 30) ||
+        (payload.iat !== undefined && payload.iat > now + 30) ||
+        typeof payload.iss !== "string" ||
+        !payload.iss.startsWith("https://" + expectedShop + ".myshopify.com/")) {
+      throw new Error("invalid session claims");
+    }
+    req.shop = expectedShop;
+    next();
+  } catch {
+    return res.status(401).json({ error: "جلسة Shopify غير صالحة أو انتهت. افتح التطبيق من Shopify Admin وحاول تاني." });
+  }
+}
+app.get("/", (req, res) => {
+  const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
+  const html = `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="shopify-api-key" content="${apiKey.replace(/[^a-zA-Z0-9_-]/g, "")}">
+<title>UTM Track — Shopify Dashboard</title>
+<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+<link rel="stylesheet" href="/dashboard.css"></head>
+<body><div id="root"></div><script src="/dashboard.js" defer></script></body></html>`;
+  res.type("html").send(html);
+});
 app.use(express.static(join(__dirname, "frontend/dist")));
 
-app.get("/api/orders", async (req, res) => {
-  const shop = req.query.shop || process.env.SHOP_NAME;
+app.get("/api/orders", verifyShopifySession, async (req, res) => {
+  const shop = req.shop;
 
   if (!shop) {
     return res.status(400).json({ error: "Missing shop" });
@@ -74,6 +129,14 @@ app.get("/api/orders", async (req, res) => {
 
     const fromStr = req.query.date_from || dateStr;
     const toStr = req.query.date_to || dateStr;
+    const valid = s => /^\d{4}-\d{2}-\d{2}$/.test(s) &&
+      !Number.isNaN(Date.parse(s + "T00:00:00Z")) &&
+      new Date(s + "T00:00:00Z").toISOString().slice(0, 10) === s;
+    if (!valid(fromStr) || !valid(toStr) || fromStr > toStr) {
+      return res.status(400).json({ error: "نطاق التاريخ غير صحيح." });
+    }
+    const days = Math.round((Date.parse(toStr) - Date.parse(fromStr)) / 86400000) + 1;
+    if (days > 366) return res.status(400).json({ error: "أقصى مدة للبحث سنة واحدة." });
 
     const minDate = `${fromStr}T00:00:00${TIMEZONE_OFFSET}`;
     const maxDate = `${toStr}T23:59:59${TIMEZONE_OFFSET}`;
@@ -139,6 +202,8 @@ app.get("/api/orders", async (req, res) => {
 
     const totalRevenue = processed.reduce((s, o) => s + o.total, 0);
     const paidOrders = processed.filter(o => o.status === "paid").length;
+    const paidOrderValue = processed.filter(o => o.status === "paid").reduce((sum, o) => sum + o.total, 0);
+    const trackedOrders = processed.filter(o => Object.values(o.utm).some(Boolean)).length;
 
     const productMap = new Map();
     processed.forEach(order => {
@@ -170,6 +235,8 @@ app.get("/api/orders", async (req, res) => {
       totalOrders: processed.length,
       totalRevenue: totalRevenue.toFixed(2),
       paidOrders,
+      paidOrderValue: paidOrderValue.toFixed(2),
+      utmCoverage: { tracked: trackedOrders, total: processed.length },
       orders: processed,
       products,
       utmSources: Object.entries(utmMap)
@@ -218,7 +285,8 @@ function extractUTM(order) {
 }
 
 app.use((req, res) => {
-  res.sendFile(join(__dirname, "frontend", "dist", "index.html"));
+  if (req.path.startsWith("/api/")) return res.status(404).json({ error: "Endpoint غير موجود." });
+  res.redirect("/");
 });
 
 app.listen(PORT, () => {
