@@ -58,7 +58,7 @@ function UTMBar({ label, count, total, color }) {
 const BAR = ["#1a73e8","#34a853","#ff6d00","#9c27b0","#00acc1","#e91e63","#f9a825"];
 
 function ProductModal({ product, orders, onClose }) {
-  const filtered = orders.filter(o => o.products.some(p => p.title === product));
+  const filtered = orders.filter(o => o.products.some(p => p.key === product.key));
   const srcMap = {}, camMap = {};
   filtered.forEach(o => {
     const src = o.utm.source   || "(غير محدد)";
@@ -68,8 +68,8 @@ function ProductModal({ product, orders, onClose }) {
   });
   const sources   = Object.entries(srcMap).sort((a,b)=>b[1]-a[1]);
   const campaigns = Object.entries(camMap).sort((a,b)=>b[1]-a[1]);
-  const totalUnits = filtered.reduce((s,o)=>s+o.products.filter(p=>p.title===product).reduce((ss,p)=>ss+p.quantity,0),0);
-  const totalRev   = filtered.reduce((s,o)=>s+o.products.filter(p=>p.title===product).reduce((ss,p)=>ss+p.price*p.quantity,0),0);
+  const totalUnits = filtered.reduce((s,o)=>s+o.products.filter(p=>p.key===product.key).reduce((ss,p)=>ss+p.quantity,0),0);
+  const totalRev   = filtered.reduce((s,o)=>s+o.products.filter(p=>p.key===product.key).reduce((ss,p)=>ss+p.price*p.quantity,0),0);
 
   return (
     <div onClick={onClose} style={{
@@ -85,7 +85,7 @@ function ProductModal({ product, orders, onClose }) {
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
           <div>
             <div style={{fontSize:11,color:"#888",marginBottom:4}}>تحليل المنتج</div>
-            <div style={{fontSize:17,fontWeight:800,color:"#222",maxWidth:420}}>{product}</div>
+            <div style={{fontSize:17,fontWeight:800,color:"#222",maxWidth:420}}>{product.name}</div>
           </div>
           <button onClick={onClose} style={{
             border:"none",background:"#f5f5f5",borderRadius:8,
@@ -182,8 +182,10 @@ export default function App() {
 
   useEffect(() => { fetchData(dateFrom, dateTo); }, []);
 
-  const setPreset = (days) => {
-    const d = new Date(), from = new Date(d);
+  const setPreset = (days, yesterday = false) => {
+    const d = new Date();
+    if (yesterday) d.setDate(d.getDate() - 1);
+    const from = new Date(d);
     from.setDate(d.getDate() - days + 1);
     const f = from.toISOString().split("T")[0];
     const t = d.toISOString().split("T")[0];
@@ -224,8 +226,8 @@ export default function App() {
                     {loading ? "⏳ جاري..." : "🔍 بحث"}
                   </button>
                   <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                    {[{l:"النهارده",d:1},{l:"أمس",d:2},{l:"7 أيام",d:7},{l:"30 يوم",d:30}].map(p=>(
-                      <button key={p.l} onClick={()=>setPreset(p.d)} style={bGhost}>{p.l}</button>
+                    {[{l:"النهارده",d:1},{l:"أمس",d:1,yesterday:true},{l:"7 أيام",d:7},{l:"30 يوم",d:30}].map(p=>(
+                      <button key={p.l} onClick={()=>setPreset(p.d,p.yesterday)} style={bGhost}>{p.l}</button>
                     ))}
                   </div>
                 </div>
@@ -321,7 +323,7 @@ export default function App() {
                           </div>
                           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
                             {data.products.map((p,i)=>(
-                              <ProductCard key={i} p={p} i={i} onClick={()=>setSelectedProduct(p.name)} />
+                              <ProductCard key={p.key} p={p} i={i} onClick={()=>setSelectedProduct(p)} />
                             ))}
                           </div>
                         </>

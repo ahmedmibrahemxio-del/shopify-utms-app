@@ -84,7 +84,7 @@ app.get("/api/orders", async (req, res) => {
       `?status=any&limit=250` +
       `&created_at_min=${encodeURIComponent(minDate)}` +
       `&created_at_max=${encodeURIComponent(maxDate)}` +
-      `&fields=id,created_at,line_items,note_attributes,landing_site,total_price,financial_status,customer,shipping_address`;
+      `&fields=id,name,order_number,created_at,line_items,note_attributes,landing_site,total_price,financial_status,customer,shipping_address`;
 
     while (url) {
       const response = await fetch(url, {
@@ -117,7 +117,7 @@ app.get("/api/orders", async (req, res) => {
 
     const processed = allOrders.map(order => ({
       id: order.id,
-      shortId: "#" + String(order.id).slice(-8),
+      shortId: order.name || (order.order_number ? "#" + order.order_number : "#" + String(order.id).slice(-8)),
       date: order.created_at,
       status: order.financial_status,
       total: parseFloat(order.total_price || 0),
@@ -126,7 +126,10 @@ app.get("/api/orders", async (req, res) => {
         : "—",
       city: order.shipping_address?.city || "—",
       country: order.shipping_address?.country || "—",
-      products: (order.line_items || []).map(i => ({
+      products: (order.line_items || []).map((i, index) => ({
+        key: i.product_id != null ? `product:${i.product_id}` :
+          i.variant_id != null ? `variant:${i.variant_id}` :
+          `line:${i.id ?? `${order.id}:${index}`}`,
         title: i.title,
         quantity: i.quantity,
         price: parseFloat(i.price)
@@ -137,17 +140,17 @@ app.get("/api/orders", async (req, res) => {
     const totalRevenue = processed.reduce((s, o) => s + o.total, 0);
     const paidOrders = processed.filter(o => o.status === "paid").length;
 
-    const productMap = {};
+    const productMap = new Map();
     processed.forEach(order => {
       order.products.forEach(p => {
-        if (!productMap[p.title]) productMap[p.title] = { units: 0, revenue: 0 };
-        productMap[p.title].units += p.quantity;
-        productMap[p.title].revenue += p.price * p.quantity;
+        const product = productMap.get(p.key) || { key: p.key, name: p.title, units: 0, revenue: 0 };
+        product.units += p.quantity;
+        product.revenue += p.price * p.quantity;
+        productMap.set(p.key, product);
       });
     });
 
-    const products = Object.entries(productMap)
-      .map(([name, data]) => ({ name, ...data }))
+    const products = [...productMap.values()]
       .sort((a, b) => b.units - a.units);
 
     const utmMap = {};
