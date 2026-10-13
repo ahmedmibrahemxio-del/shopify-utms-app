@@ -223,8 +223,15 @@ app.get("/api/orders", verifyDashboardSession, async (req, res) => {
 
     const productMap = new Map();
     processed.forEach(order => {
+      const productsInOrder = new Set();
       order.products.forEach(p => {
-        const product = productMap.get(p.key) || { key: p.key, name: p.title, units: 0, revenue: 0 };
+        const product = productMap.get(p.key) || {
+          key: p.key, name: p.title, orders: 0, units: 0, revenue: 0
+        };
+        if (!productsInOrder.has(p.key)) {
+          product.orders += 1;
+          productsInOrder.add(p.key);
+        }
         product.units += p.quantity;
         product.revenue += p.price * p.quantity;
         productMap.set(p.key, product);
@@ -232,7 +239,7 @@ app.get("/api/orders", verifyDashboardSession, async (req, res) => {
     });
 
     const products = [...productMap.values()]
-      .sort((a, b) => b.units - a.units);
+      .sort((a, b) => b.orders - a.orders || b.units - a.units);
 
     const utmMap = {};
     const camMap = {};
