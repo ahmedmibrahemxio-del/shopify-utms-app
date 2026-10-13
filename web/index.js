@@ -3,6 +3,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import { randomBytes, pbkdf2Sync, timingSafeEqual, createHash } from "node:crypto";
 
 dotenv.config();
 
@@ -55,108 +56,63 @@ function safeDecode(value = "") {
 
 app.use(express.json());
 
-// Enforce Shopify embedded session authentication for all order data.
-async function verifyShopifySession(req, res, next) {
-  const authorization = req.get("authorization") || "";
-  const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(authorization);
-  const reject = (code, status = 401) => {
-    // Log a reason code only. Never log JWTs, headers, secrets, or order data.
-    console.warn("[shopify-auth]", code);
-    if (status === 401) {
-      // Shopify App Bridge can request a fresh short-lived ID token and retry.
-      res.set("X-Shopify-Retry-Invalid-Session-Request", "1");
-    }
-    return res.status(status).json({
-      error: status === 503
-        ? "إعدادات توثيق Shopify غير مكتملة على Render."
-        : "تعذر التحقق من جلسة Shopify. افتح التطبيق من داخل Shopify Admin وحاول تاني.",
-      code
-    });
-  };
-
-  if (!match) return reject("AUTH_MISSING_OR_MALFORMED_TOKEN");
-  const secret = process.env.SHOPIFY_CLIENT_SECRET;
-  const apiKey = process.env.SHOPIFY_CLIENT_ID;
-  const shopConfig = (process.env.SHOP_NAME || "").trim();
-  const expectedShop = shopConfig
-    .replace(/^https?:\/\//i, "")
-    .replace(/\.myshopify\.com(?:\/.*)?$/i, "")
-    .replace(/\/.*$/, "")
-    .toLowerCase();
-  if (!secret || !apiKey || !/^[a-z0-9][a-z0-9-]*$/.test(expectedShop)) {
-    return reject("AUTH_CONFIGURATION_MISSING", 503);
+// Private dashboard authentication, independent of Shopify App Bridge sessions.
+const sessions = new Map();
+const attempts = new Map();
+const SESSION_MS = 8 * 60 * 60 * 1000;
+const hashToken = token => createHash("sha256").update(token).digest("hex");
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) res.set("Cache-Control", "no-store");
+  next();
+});
+app.post("/api/login", (req, res) => {
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const existing = attempts.get(ip);
+  if (existing && existing.until > now && existing.count >= 5) {
+    return res.status(429).json({ error: "محاولات كتير. جرّب بعد 15 دقيقة." });
   }
-
-  try {
-    const parts = match[1].split(".");
-    const decode = part => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    const header = decode(parts[0]);
-    if (header?.alg !== "HS256") return reject("AUTH_UNSUPPORTED_ALGORITHM");
-    const payload = decode(parts[1]);
-    const now = Math.floor(Date.now() / 1000);
-    if (!Number.isFinite(payload.exp) || payload.exp <= now) {
-      return reject("AUTH_TOKEN_EXPIRED");
-    }
-    if (payload.nbf !== undefined &&
-        (!Number.isFinite(payload.nbf) || payload.nbf > now + 30)) {
-      return reject("AUTH_TOKEN_NOT_YET_VALID");
-    }
-    if (payload.iat !== undefined &&
-        (!Number.isFinite(payload.iat) || payload.iat > now + 30)) {
-      return reject("AUTH_INVALID_ISSUED_AT");
-    }
-    if (payload.aud !== apiKey) return reject("AUTH_CLIENT_ID_MISMATCH");
-
-    // Shopify's specification requires issuer/destination HOSTNAMES to match,
-    // not a specific issuer URL path or trailing slash.
-    let issuer, destination;
-    try {
-      issuer = new URL(payload.iss);
-      destination = new URL(payload.dest);
-    } catch {
-      return reject("AUTH_INVALID_SHOP_URL");
-    }
-    if (issuer.protocol !== "https:" || destination.protocol !== "https:" ||
-        issuer.username || issuer.password || destination.username || destination.password ||
-        issuer.hostname.toLowerCase() !== destination.hostname.toLowerCase()) {
-      return reject("AUTH_ISSUER_DESTINATION_MISMATCH");
-    }
-    if (destination.hostname.toLowerCase() !== expectedShop + ".myshopify.com") {
-      return reject("AUTH_SHOP_MISMATCH");
-    }
-    // Exchange the ID token for a short-lived online token; Shopify verifies authenticity.
-    const exchange = await fetch("https://" + expectedShop + ".myshopify.com/admin/oauth/access_token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: apiKey,
-        client_secret: secret,
-        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-        subject_token: match[1],
-        subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-        requested_token_type: "urn:shopify:params:oauth:token-type:online-access-token"
-      }),
-      signal: AbortSignal.timeout(12000)
-    });
-    if (!exchange.ok) {
-      return reject(
-        exchange.status === 400 ? "AUTH_SHOPIFY_TOKEN_REJECTED" :
-        (exchange.status === 401 || exchange.status === 403) ?
-          "AUTH_SHOPIFY_CREDENTIALS_REJECTED" : "AUTH_SHOPIFY_EXCHANGE_FAILED",
-        exchange.status === 400 ? 401 : 502
-      );
-    }
-    const credentials = await exchange.json();
-    if (!credentials || typeof credentials.access_token !== "string" || !credentials.access_token) {
-      return reject("AUTH_SHOPIFY_EMPTY_ACCESS_TOKEN", 502);
-    }
-    req.shop = expectedShop;
-    req.shopifyToken = credentials.access_token;
-    next();
-  } catch {
-    return reject("AUTH_TOKEN_DECODE_FAILED");
+  const config = process.env.DASHBOARD_PASSWORD_HASH || "";
+  const [salt, expected] = config.split(":");
+  if (!salt || !expected || !/^[a-f0-9]{32}$/i.test(salt) || !/^[a-f0-9]{64}$/i.test(expected)) {
+    return res.status(503).json({ error: "إعداد كلمة المرور غير مكتمل." });
   }
+  const password = req.body?.password;
+  if (typeof password !== "string" || password.length > 256) {
+    return res.status(400).json({ error: "كلمة المرور غير صحيحة." });
+  }
+  const actual = pbkdf2Sync(password, Buffer.from(salt, "hex"), 210000, 32, "sha256");
+  const correct = timingSafeEqual(actual, Buffer.from(expected, "hex"));
+  if (!correct) {
+    attempts.set(ip, { count: existing && existing.until > now ? existing.count + 1 : 1, until: now + 900000 });
+    return res.status(401).json({ error: "كلمة المرور غير صحيحة." });
+  }
+  attempts.delete(ip);
+  const token = randomBytes(32).toString("base64url");
+  sessions.set(hashToken(token), now + SESSION_MS);
+  return res.json({ token, expiresIn: SESSION_MS / 1000 });
+});
+function verifyDashboardSession(req, res, next) {
+  const header = req.get("authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const key = token.length >= 32 && token.length <= 256 ? hashToken(token) : "";
+  const expiration = sessions.get(key);
+  if (!expiration || expiration <= Date.now()) {
+    if (expiration) sessions.delete(key);
+    return res.status(401).json({ error: "سجّل دخول بكلمة المرور علشان تشوف الأوردرات.", code: "DASHBOARD_LOGIN_REQUIRED" });
+  }
+  next();
 }
+app.post("/api/logout", verifyDashboardSession, (req, res) => {
+  sessions.delete(hashToken((req.get("authorization") || "").slice(7)));
+  res.json({ ok: true });
+});
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, expiration] of sessions) if (expiration <= now) sessions.delete(key);
+  for (const [key, entry] of attempts) if (entry.until <= now) attempts.delete(key);
+}, 10 * 60 * 1000).unref();
 
 app.get("/", (req, res) => {
   const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
@@ -171,15 +127,15 @@ app.get("/", (req, res) => {
 });
 app.use(express.static(join(__dirname, "frontend/dist")));
 
-app.get("/api/orders", verifyShopifySession, async (req, res) => {
-  const shop = req.shop;
+app.get("/api/orders", verifyDashboardSession, async (req, res) => {
+  const shop = (process.env.SHOP_NAME || "").replace(/\\.myshopify\\.com$/i, "");
 
   if (!shop) {
     return res.status(400).json({ error: "Missing shop" });
   }
 
   try {
-    const token = req.shopifyToken;
+    const token = await getShopifyAccessToken(shop);
 
     const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+03:00";
     const today = new Date();
