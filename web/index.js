@@ -3,7 +3,6 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { createHmac, timingSafeEqual } from "node:crypto";
 
 dotenv.config();
 
@@ -57,7 +56,7 @@ function safeDecode(value = "") {
 app.use(express.json());
 
 // Enforce Shopify embedded session authentication for all order data.
-function verifyShopifySession(req, res, next) {
+async function verifyShopifySession(req, res, next) {
   const authorization = req.get("authorization") || "";
   const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(authorization);
   const reject = (code, status = 401) => {
@@ -93,13 +92,6 @@ function verifyShopifySession(req, res, next) {
     const decode = part => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
     const header = decode(parts[0]);
     if (header?.alg !== "HS256") return reject("AUTH_UNSUPPORTED_ALGORITHM");
-    const expectedSignature = createHmac("sha256", secret)
-      .update(parts[0] + "." + parts[1]).digest();
-    const actualSignature = Buffer.from(parts[2], "base64url");
-    if (actualSignature.length !== expectedSignature.length ||
-        !timingSafeEqual(expectedSignature, actualSignature)) {
-      return reject("AUTH_SIGNATURE_MISMATCH");
-    }
     const payload = decode(parts[1]);
     const now = Math.floor(Date.now() / 1000);
     if (!Number.isFinite(payload.exp) || payload.exp <= now) {
@@ -132,7 +124,34 @@ function verifyShopifySession(req, res, next) {
     if (destination.hostname.toLowerCase() !== expectedShop + ".myshopify.com") {
       return reject("AUTH_SHOP_MISMATCH");
     }
+    // Exchange the ID token for a short-lived online token; Shopify verifies authenticity.
+    const exchange = await fetch("https://" + expectedShop + ".myshopify.com/admin/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: apiKey,
+        client_secret: secret,
+        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+        subject_token: match[1],
+        subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+        requested_token_type: "urn:shopify:params:oauth:token-type:online-access-token"
+      }),
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!exchange.ok) {
+      return reject(
+        exchange.status === 400 ? "AUTH_SHOPIFY_TOKEN_REJECTED" :
+        (exchange.status === 401 || exchange.status === 403) ?
+          "AUTH_SHOPIFY_CREDENTIALS_REJECTED" : "AUTH_SHOPIFY_EXCHANGE_FAILED",
+        exchange.status === 400 ? 401 : 502
+      );
+    }
+    const credentials = await exchange.json();
+    if (!credentials || typeof credentials.access_token !== "string" || !credentials.access_token) {
+      return reject("AUTH_SHOPIFY_EMPTY_ACCESS_TOKEN", 502);
+    }
     req.shop = expectedShop;
+    req.shopifyToken = credentials.access_token;
     next();
   } catch {
     return reject("AUTH_TOKEN_DECODE_FAILED");
@@ -160,7 +179,7 @@ app.get("/api/orders", verifyShopifySession, async (req, res) => {
   }
 
   try {
-    const token = await getShopifyAccessToken(shop);
+    const token = req.shopifyToken;
 
     const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+03:00";
     const today = new Date();
