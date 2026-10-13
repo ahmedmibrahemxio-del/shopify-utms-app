@@ -304,7 +304,7 @@
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) throw new Error("الخادم رجّع استجابة غير متوقعة، جرّب التحديث.");
       const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "فشل في جلب الأوردرات (" + response.status + ")");
+      if (!response.ok) throw new Error((json.error || "فشل في جلب الأوردرات") + (json.code ? " [" + json.code + "]" : "") + " (HTTP " + response.status + ")");
       state.data = json;
       state.selectedProduct = null;
       state.refreshedAt = new Date();

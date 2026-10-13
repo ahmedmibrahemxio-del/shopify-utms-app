@@ -58,46 +58,87 @@ app.use(express.json());
 
 // Enforce Shopify embedded session authentication for all order data.
 function verifyShopifySession(req, res, next) {
-  const authorization = req.headers.authorization || "";
-  if (!authorization.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "افتح التطبيق من داخل Shopify Admin." });
-  }
+  const authorization = req.get("authorization") || "";
+  const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(authorization);
+  const reject = (code, status = 401) => {
+    // Log a reason code only. Never log JWTs, headers, secrets, or order data.
+    console.warn("[shopify-auth]", code);
+    if (status === 401) {
+      // Shopify App Bridge can request a fresh short-lived ID token and retry.
+      res.set("X-Shopify-Retry-Invalid-Session-Request", "1");
+    }
+    return res.status(status).json({
+      error: status === 503
+        ? "إعدادات توثيق Shopify غير مكتملة على Render."
+        : "تعذر التحقق من جلسة Shopify. افتح التطبيق من داخل Shopify Admin وحاول تاني.",
+      code
+    });
+  };
+
+  if (!match) return reject("AUTH_MISSING_OR_MALFORMED_TOKEN");
   const secret = process.env.SHOPIFY_CLIENT_SECRET;
   const apiKey = process.env.SHOPIFY_CLIENT_ID;
-  const expectedShop = (process.env.SHOP_NAME || "").replace(/\.myshopify\.com$/i, "").toLowerCase();
-  if (!secret || !apiKey || !expectedShop) {
-    return res.status(503).json({ error: "إعدادات توثيق Shopify غير مكتملة على الخادم." });
+  const shopConfig = (process.env.SHOP_NAME || "").trim();
+  const expectedShop = shopConfig
+    .replace(/^https?:\/\//i, "")
+    .replace(/\.myshopify\.com(?:\/.*)?$/i, "")
+    .replace(/\/.*$/, "")
+    .toLowerCase();
+  if (!secret || !apiKey || !/^[a-z0-9][a-z0-9-]*$/.test(expectedShop)) {
+    return reject("AUTH_CONFIGURATION_MISSING", 503);
   }
+
   try {
-    const parts = authorization.slice(7).split(".");
-    if (parts.length !== 3) throw new Error("invalid token");
-    const decode = s => JSON.parse(Buffer.from(s, "base64url").toString("utf8"));
+    const parts = match[1].split(".");
+    const decode = part => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
     const header = decode(parts[0]);
-    if (header.alg !== "HS256") throw new Error("unsupported algorithm");
-    const signature = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
-    const provided = Buffer.from(parts[2], "base64url");
-    if (signature.length !== provided.length || !timingSafeEqual(signature, provided)) {
-      throw new Error("invalid signature");
+    if (header?.alg !== "HS256") return reject("AUTH_UNSUPPORTED_ALGORITHM");
+    const expectedSignature = createHmac("sha256", secret)
+      .update(parts[0] + "." + parts[1]).digest();
+    const actualSignature = Buffer.from(parts[2], "base64url");
+    if (actualSignature.length !== expectedSignature.length ||
+        !timingSafeEqual(expectedSignature, actualSignature)) {
+      return reject("AUTH_SIGNATURE_MISMATCH");
     }
     const payload = decode(parts[1]);
     const now = Math.floor(Date.now() / 1000);
-    const dest = new URL(payload.dest || "");
-    if (dest.protocol !== "https:" ||
-        dest.hostname.toLowerCase() !== expectedShop + ".myshopify.com" ||
-        payload.aud !== apiKey ||
-        !Number.isFinite(payload.exp) || payload.exp <= now ||
-        (payload.nbf !== undefined && payload.nbf > now + 30) ||
-        (payload.iat !== undefined && payload.iat > now + 30) ||
-        typeof payload.iss !== "string" ||
-        !payload.iss.startsWith("https://" + expectedShop + ".myshopify.com/")) {
-      throw new Error("invalid session claims");
+    if (!Number.isFinite(payload.exp) || payload.exp <= now) {
+      return reject("AUTH_TOKEN_EXPIRED");
+    }
+    if (payload.nbf !== undefined &&
+        (!Number.isFinite(payload.nbf) || payload.nbf > now + 30)) {
+      return reject("AUTH_TOKEN_NOT_YET_VALID");
+    }
+    if (payload.iat !== undefined &&
+        (!Number.isFinite(payload.iat) || payload.iat > now + 30)) {
+      return reject("AUTH_INVALID_ISSUED_AT");
+    }
+    if (payload.aud !== apiKey) return reject("AUTH_CLIENT_ID_MISMATCH");
+
+    // Shopify's specification requires issuer/destination HOSTNAMES to match,
+    // not a specific issuer URL path or trailing slash.
+    let issuer, destination;
+    try {
+      issuer = new URL(payload.iss);
+      destination = new URL(payload.dest);
+    } catch {
+      return reject("AUTH_INVALID_SHOP_URL");
+    }
+    if (issuer.protocol !== "https:" || destination.protocol !== "https:" ||
+        issuer.username || issuer.password || destination.username || destination.password ||
+        issuer.hostname.toLowerCase() !== destination.hostname.toLowerCase()) {
+      return reject("AUTH_ISSUER_DESTINATION_MISMATCH");
+    }
+    if (destination.hostname.toLowerCase() !== expectedShop + ".myshopify.com") {
+      return reject("AUTH_SHOP_MISMATCH");
     }
     req.shop = expectedShop;
     next();
   } catch {
-    return res.status(401).json({ error: "جلسة Shopify غير صالحة أو انتهت. افتح التطبيق من Shopify Admin وحاول تاني." });
+    return reject("AUTH_TOKEN_DECODE_FAILED");
   }
 }
+
 app.get("/", (req, res) => {
   const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
   const html = `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
