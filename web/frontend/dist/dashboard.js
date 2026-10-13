@@ -8,7 +8,7 @@
     from: new Date().toISOString().slice(0, 10),
     to: new Date().toISOString().slice(0, 10),
     source: "", campaign: "", product: "", search: "", level: "campaign",
-    selectedProduct: null, refreshedAt: null
+    selectedProduct: null, refreshedAt: null, sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
   };
   const labels = {
     overview: "نظرة عامة", campaigns: "أداء الحملات",
@@ -252,6 +252,40 @@
         '</span><strong>' + money(o.total) + '</strong></div>').join("") +
       '</div></section></div>';
   }
+  function loginPage() {
+    return '<div class="login-backdrop"><section class="login-card"><div class="brand-icon">UT</div>' +
+      '<h2>تسجيل الدخول إلى UTM Track</h2><p>اكتب كلمة المرور الخاصة بالـDashboard لعرض بيانات الأوردرات.</p>' +
+      '<form id="login-form"><label for="dashboard-password">كلمة المرور</label>' +
+      '<input id="dashboard-password" type="password" autocomplete="current-password" required />' +
+      (state.loginError ? '<div class="inline-error">' + safe(state.loginError) + '</div>' : '') +
+      '<button class="primary-button" type="submit" ' + (state.busy ? "disabled" : "") + '>دخول آمن</button></form>' +
+      '</section></div>';
+  }
+  async function login(password) {
+    if (state.busy) return;
+    state.busy = true;
+    state.loginError = "";
+    render();
+    try {
+      const response = await fetch("/api/login", {
+        method: "POST",
+        headers: {"Content-Type":"application/json","Accept":"application/json"},
+        body: JSON.stringify({password}),
+        cache: "no-store"
+      });
+      const result = await response.json();
+      if (!response.ok || !result.token) throw new Error(result.error || "تعذر تسجيل الدخول");
+      state.sessionToken = result.token;
+      sessionStorage.setItem("utm_track_session", result.token);
+      state.error = "";
+    } catch (err) {
+      state.loginError = err.message || "تعذر تسجيل الدخول";
+    } finally {
+      state.busy = false;
+      render();
+    }
+    if (state.sessionToken) await load();
+  }
   function render() {
     if (!root) return;
     let body = "";
@@ -268,6 +302,7 @@
         state.view === "products" ? productCards() : utmTable()) + '</main>' +
         productModal();
     }
+    if (!state.sessionToken) { root.innerHTML = loginPage(); return; }
     root.innerHTML = '<div class="app-shell"><header class="topbar">' +
       '<div class="identity"><div class="brand-icon">UT</div><div><h1>UTM Track</h1><span>Shopify Orders Intelligence</span></div></div>' +
       '<div class="header-right"><span class="secure-pill">● متجر موثّق</span><button class="refresh-button" data-action="retry" ' +
@@ -292,10 +327,7 @@
     state.error = "";
     render();
     try {
-      if (!window.shopify || typeof window.shopify.idToken !== "function") {
-        throw new Error("افتح التطبيق من داخل Shopify Admin، مش من رابط Render المباشر.");
-      }
-      const token = await window.shopify.idToken();
+      const token = state.sessionToken;
       const query = new URLSearchParams({date_from: state.from, date_to: state.to});
       const response = await fetch("/api/orders?" + query.toString(), {
         headers: {Authorization: "Bearer " + token, Accept: "application/json"},
@@ -304,6 +336,12 @@
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) throw new Error("الخادم رجّع استجابة غير متوقعة، جرّب التحديث.");
       const json = await response.json();
+      if (response.status === 401 && json.code === "DASHBOARD_LOGIN_REQUIRED") {
+        state.sessionToken = "";
+        sessionStorage.removeItem("utm_track_session");
+        state.loginError = "الجلسة انتهت. سجل الدخول مرة تانية.";
+        return;
+      }
       if (!response.ok) throw new Error((json.error || "فشل في جلب الأوردرات") + (json.code ? " [" + json.code + "]" : "") + " (HTTP " + response.status + ")");
       state.data = json;
       state.selectedProduct = null;
@@ -330,6 +368,11 @@
     a.remove();
     URL.revokeObjectURL(a.href);
   }
+  root.addEventListener("submit", event => {
+    if (event.target?.id !== "login-form") return;
+    event.preventDefault();
+    login(event.target.querySelector("#dashboard-password").value);
+  });
   root.addEventListener("click", (event) => {
     if (event.target.classList.contains("modal-backdrop")) {
       state.selectedProduct = null; render(); return;
@@ -368,5 +411,5 @@
     }
   });
   render();
-  load();
+  if (state.sessionToken) load();
 })();
