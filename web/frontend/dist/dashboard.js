@@ -8,7 +8,7 @@
     from: new Date().toISOString().slice(0, 10),
     to: new Date().toISOString().slice(0, 10),
     source: "", campaign: "", product: "", search: "", level: "campaign",
-    selectedProduct: null, refreshedAt: null, page: 0, presetKey: "today", productSearch: "", productSort: "orders", productPage: 0, sessionToken: sessionStorage.getItem("utm_track_session") || "", loginError: "", password: ""
+    selectedProduct: null, refreshedAt: null, page: 0, presetKey: "today", productSearch: "", productSort: "orders", productPage: 0, directOnly: true
   };
   const labels = {
     overview: "نظرة عامة", campaigns: "أداء الحملات",
@@ -316,44 +316,8 @@
         '</span><strong>' + money(o.total) + '</strong></div>').join("") +
       '</div></section></div>';
   }
-  function loginPage() {
-    return '<div class="login-backdrop"><section class="login-card"><div class="brand-icon">UT</div>' +
-      '<h2>أهلًا بيك في UTM Track</h2><p>كل أوردرات Shopify وتحليل الحملات في مكان واحد. أدخل كلمة المرور الخاصة بالـDashboard.</p>' +
-      '<form id="login-form"><label for="dashboard-password">كلمة مرور لوحة التحكم</label>' +
-      '<input id="dashboard-password" type="password" autocomplete="current-password" required placeholder="••••••••" />' +
-      (state.loginError ? '<div class="inline-error" role="alert">' + safe(state.loginError) + '</div>' : '') +
-      '<button class="primary-button" type="submit" ' + (state.busy ? "disabled" : "") + '>' +
-      (state.busy ? "جاري الدخول…" : "تسجيل الدخول ←") + '</button></form>' +
-      '<div class="login-footnote">جلسة خاصة لحماية بيانات الطلبات</div></section></div>';
-  }
-  async function login(password) {
-    if (state.busy) return;
-    state.busy = true;
-    state.loginError = "";
-    render();
-    try {
-      const response = await fetch("/api/login", {
-        method: "POST",
-        headers: {"Content-Type":"application/json","Accept":"application/json"},
-        body: JSON.stringify({password}),
-        cache: "no-store"
-      });
-      const result = await response.json();
-      if (!response.ok || !result.token) throw new Error(result.error || "تعذر تسجيل الدخول");
-      state.sessionToken = result.token;
-      sessionStorage.setItem("utm_track_session", result.token);
-      state.error = "";
-    } catch (err) {
-      state.loginError = err.message || "تعذر تسجيل الدخول";
-    } finally {
-      state.busy = false;
-      render();
-    }
-    if (state.sessionToken) await load();
-  }
   function render() {
     if (!root) return;
-    if (!state.sessionToken) { root.innerHTML = loginPage(); return; }
     const viewName = labels[state.view] || labels.overview;
     const nav = Object.keys(labels).map(k => '<button class="nav-item ' +
       (state.view === k ? "active" : "") + '" data-view="' + k + '"' +
@@ -375,7 +339,7 @@
       '<div class="side-brand"><div class="brand-icon">UT</div><div><h1>UTM Track</h1><p>STORE ANALYTICS</p></div></div>' +
       '<div class="nav-section-title">WORKSPACE</div><nav class="sidebar-nav" aria-label="أقسام لوحة التحكم">' +
       nav + '</nav><div class="sidebar-bottom"><div class="sidebar-hint"><i></i>' +
-      '<span>لوحة خاصة بمتجرك</span></div><button class="logout-button" data-action="logout">↩ تسجيل الخروج</button>' +
+      '<span>داخل Shopify Admin</span></div>' +
       '</div></aside><div class="workspace"><header class="topbar"><div class="crumb">' +
       '<span>لوحة التحكم</span><span class="chevron">/</span><strong>' + safe(viewName) + '</strong></div>' +
       '<div class="header-right"><span class="secure-pill"><span class="dot"></span>جلسة خاصة</span>' +
@@ -405,44 +369,21 @@
     state.error = "";
     render();
     try {
-      const token = state.sessionToken;
-      const query = new URLSearchParams({date_from: state.from, date_to: state.to});
-      const response = await fetch("/api/orders?" + query.toString(), {
-        headers: {Authorization: "Bearer " + token, Accept: "application/json"},
-        cache: "no-store"
-      });
-      const contentType = response.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) throw new Error("الخادم رجّع استجابة غير متوقعة، جرّب التحديث.");
-      const json = await response.json();
-      if (response.status === 401 && json.code === "DASHBOARD_LOGIN_REQUIRED") {
-        state.sessionToken = "";
-        sessionStorage.removeItem("utm_track_session");
-        state.loginError = "الجلسة انتهت. سجل الدخول مرة تانية.";
-        return;
+      if (!window.shopify || typeof window.shopify.idToken !== "function") {
+        throw new Error("SHOPIFY_ADMIN_ONLY: افتح UTM Track من داخل Shopify Admin، مش من رابط Render المباشر.");
       }
-      if (!response.ok) throw new Error((json.error || "فشل في جلب الأوردرات") + (json.code ? " [" + json.code + "]" : "") + " (HTTP " + response.status + ")");
-      state.data = json;
+      const data = await window.utmDirectApi.loadOrders(state.from, state.to);
+      state.data = data;
       state.selectedProduct = null;
       state.refreshedAt = new Date();
     } catch (err) {
-      state.error = err.message || "حصل خطأ أثناء جلب البيانات.";
+      state.error = err.message || "تعذر تحميل بيانات Shopify.";
+      state.data = null;
     } finally {
       state.busy = false;
       render();
     }
   }
-  async function logout() {
-    const token = state.sessionToken;
-    state.sessionToken = "";
-    state.data = null;
-    state.error = "";
-    sessionStorage.removeItem("utm_track_session");
-    render();
-    try {
-      await fetch("/api/logout", {method:"POST",headers:{Authorization:"Bearer " + token},cache:"no-store"});
-    } catch { /* Still logged out of the browser */ }
-  }
-
   function exportCampaigns() {
     const values = [["Source","Campaign","Content","Orders","Order Value","Paid Orders","Units"]];
     aggregate(currentOrders(), state.level).forEach(g =>
@@ -464,11 +405,7 @@
       state.productSearch = event.target.querySelector("#product-search-input").value.trim();
       state.productPage = 0;
       render();
-      return;
     }
-    if (event.target?.id !== "login-form") return;
-    event.preventDefault();
-    login(event.target.querySelector("#dashboard-password").value);
   });
   root.addEventListener("click", (event) => {
     if (event.target.classList.contains("modal-backdrop")) {
@@ -486,7 +423,6 @@
     if (el.dataset.product) { state.selectedProduct = el.dataset.product; render(); return; }
     switch (el.dataset.action) {
       case "retry": load(); break;
-      case "logout": logout(); break;
       case "search": {
         const from = $("#date-from")?.value, to = $("#date-to")?.value;
         if (!from || !to || from > to) {
@@ -518,5 +454,5 @@
     }
   });
   render();
-  if (state.sessionToken) load();
+  load();
 })();
