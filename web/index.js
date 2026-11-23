@@ -89,17 +89,25 @@ app.use((req, res, next) => {
 const b64urlJson = part => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
 const normalizeShop = s => String(s || "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/\.myshopify\.com$/, "");
 
+const SECRET_ENV_KEYS = ["SHOPIFY_CLIENT_SECRET", "SHOPIFY_API_SECRET", "SHOPIFY_API_SECRET_KEY", "SHOPIFY_CLIENT_SECRET_OLD"];
+const candidateSecrets = () => [...new Set(SECRET_ENV_KEYS.map(k => (process.env[k] || "").trim()).filter(Boolean))];
+const allowedShops = () => new Set([process.env.SHOP_NAME, ...(process.env.ALLOWED_SHOPS || "").split(",")]
+  .map(normalizeShop).filter(Boolean));
+
 function verifyShopifySessionToken(token) {
-  const secret = process.env.SHOPIFY_CLIENT_SECRET || "";
-  const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
-  if (!secret || !apiKey) throw new Error("server-misconfigured");
+  const secrets = candidateSecrets();
+  const apiKey = (process.env.SHOPIFY_CLIENT_ID || "").trim();
+  if (!secrets.length || !apiKey) throw new Error("server-misconfigured");
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("malformed");
   const header = b64urlJson(parts[0]);
   if (header.alg !== "HS256") throw new Error("bad-alg");
-  const expected = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
   const actual = Buffer.from(parts[2], "base64url");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("bad-signature");
+  const signed = secrets.some(secret => {
+    const expected = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  });
+  if (!signed) throw new Error("bad-signature");
   const payload = b64urlJson(parts[1]);
   const now = Math.floor(Date.now() / 1000);
   const skew = 10;
@@ -107,8 +115,8 @@ function verifyShopifySessionToken(token) {
   if (typeof payload.nbf === "number" && payload.nbf - skew > now) throw new Error("not-yet-valid");
   const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
   if (!aud.includes(apiKey)) throw new Error("bad-audience");
-  const configuredShop = normalizeShop(process.env.SHOP_NAME);
-  if (configuredShop && normalizeShop(payload.dest) !== configuredShop) throw new Error("wrong-shop");
+  const shops = allowedShops();
+  if (shops.size && !shops.has(normalizeShop(payload.dest))) throw new Error("wrong-shop");
   return payload;
 }
 
@@ -130,7 +138,8 @@ function verifyDashboardSession(req, res, next) {
     try { claims = b64urlJson(token.split(".")[1]); } catch {}
     console.warn("[auth] rejected:", err.message, JSON.stringify({
       dest: claims.dest, audMatches: claims.aud === process.env.SHOPIFY_CLIENT_ID,
-      configuredShop: normalizeShop(process.env.SHOP_NAME), expInSec: claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : null
+      allowedShops: [...allowedShops()], secretEnvPresent: SECRET_ENV_KEYS.filter(k => process.env[k]),
+      secretHadWhitespace: SECRET_ENV_KEYS.some(k => process.env[k] && process.env[k] !== process.env[k].trim()), expInSec: claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : null
     }));
     return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED", reason: err.message });
   }
