@@ -107,8 +107,8 @@ function verifyShopifySessionToken(token) {
     const expected = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   });
-  if (!signed) throw new Error("bad-signature");
   const payload = b64urlJson(parts[1]);
+  payload._locallySigned = signed;
   const now = Math.floor(Date.now() / 1000);
   const skew = 10;
   if (typeof payload.exp !== "number" || payload.exp + skew < now) throw new Error("expired");
@@ -120,6 +120,37 @@ function verifyShopifySessionToken(token) {
   return payload;
 }
 
+// Ask Shopify to confirm the session token (OAuth token exchange). Used when the local
+// signature check can't confirm it. Results are cached for the token's short lifetime.
+const verifiedTokens = new Map();
+async function confirmWithShopify(token, payload) {
+  const key = createHmac("sha256", "cache").update(token).digest("hex");
+  const cached = verifiedTokens.get(key);
+  if (cached && cached > Date.now()) return true;
+  const host = new URL(payload.dest).host;
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(host)) throw new Error("bad-dest");
+  const response = await fetch(`https://${host}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      client_id: (process.env.SHOPIFY_CLIENT_ID || "").trim(),
+      client_secret: candidateSecrets()[0],
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: token,
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token"
+    })
+  });
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 300);
+    console.warn("[auth] shopify token-exchange rejected:", response.status, body);
+    throw new Error("shopify-rejected-" + response.status);
+  }
+  verifiedTokens.set(key, payload.exp * 1000);
+  for (const [k, exp] of verifiedTokens) if (exp <= Date.now()) verifiedTokens.delete(k);
+  return true;
+}
+
 function verifyDashboardSession(req, res, next) {
   const header = req.get("authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -127,10 +158,14 @@ function verifyDashboardSession(req, res, next) {
     console.warn("[auth] rejected: no-token");
     return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED" });
   }
-  try {
-    req.shopifySession = verifyShopifySessionToken(token);
+  (async () => {
+    const payload = verifyShopifySessionToken(token);
+    if (!payload._locallySigned) await confirmWithShopify(token, payload);
+    return payload;
+  })().then(payload => {
+    req.shopifySession = payload;
     next();
-  } catch (err) {
+  }).catch(err => {
     if (err.message === "server-misconfigured") {
       return res.status(503).json({ error: "SHOPIFY_CLIENT_ID أو SHOPIFY_CLIENT_SECRET مش متظبطين على السيرفر." });
     }
@@ -142,7 +177,7 @@ function verifyDashboardSession(req, res, next) {
       secretHadWhitespace: SECRET_ENV_KEYS.some(k => process.env[k] && process.env[k] !== process.env[k].trim()), expInSec: claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : null
     }));
     return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED", reason: err.message });
-  }
+  });
 }
 
 app.get("/", (req, res) => {
