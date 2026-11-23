@@ -3,7 +3,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { randomBytes, pbkdf2Sync, timingSafeEqual, createHash } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 dotenv.config();
 
@@ -46,6 +46,28 @@ async function getShopifyAccessToken(shop) {
   return cachedToken;
 }
 
+const STORE_TZ = process.env.STORE_TIMEZONE || "Africa/Cairo";
+
+// Minutes the time zone is ahead of UTC at the instant `ms`.
+function tzOffsetMinutes(ms, timeZone = STORE_TZ) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+    timeZone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  }).formatToParts(new Date(ms)).map(p => [p.type, p.value]));
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);
+}
+
+// "2026-11-23" + "00:00:00" in the store's time zone -> "2026-11-23T00:00:00+02:00"
+function zonedIso(dateStr, time, timeZone = STORE_TZ) {
+  const wall = Date.parse(`${dateStr}T${time}Z`);
+  let offset = tzOffsetMinutes(wall, timeZone);
+  offset = tzOffsetMinutes(wall - offset * 60000, timeZone);
+  const sign = offset >= 0 ? "+" : "-";
+  const abs = Math.abs(offset);
+  return `${dateStr}T${time}${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+}
+
 function safeDecode(value = "") {
   try {
     return decodeURIComponent(String(value).replace(/\+/g, " "));
@@ -56,65 +78,61 @@ function safeDecode(value = "") {
 
 app.use(express.json());
 
-// Private dashboard authentication, independent of Shopify App Bridge sessions.
-const sessions = new Map();
-const attempts = new Map();
-const SESSION_MS = 8 * 60 * 60 * 1000;
-const hashToken = token => createHash("sha256").update(token).digest("hex");
+// Shopify Admin session-token authentication (App Bridge id token, HS256 JWT).
+// The dashboard opens directly inside Shopify Admin with no password.
 app.disable("x-powered-by");
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/")) res.set("Cache-Control", "no-store");
   next();
 });
-app.post("/api/login", (req, res) => {
-  const ip = req.ip || "unknown";
-  const now = Date.now();
-  const existing = attempts.get(ip);
-  if (existing && existing.until > now && existing.count >= 5) {
-    return res.status(429).json({ error: "محاولات كتير. جرّب بعد 15 دقيقة." });
-  }
-  const config = process.env.DASHBOARD_PASSWORD_HASH || "";
-  const [salt, expected] = config.split(":");
-  if (!salt || !expected || !/^[a-f0-9]{32}$/i.test(salt) || !/^[a-f0-9]{64}$/i.test(expected)) {
-    return res.status(503).json({ error: "إعداد كلمة المرور غير مكتمل." });
-  }
-  const password = req.body?.password;
-  if (typeof password !== "string" || password.length > 256) {
-    return res.status(400).json({ error: "كلمة المرور غير صحيحة." });
-  }
-  const actual = pbkdf2Sync(password, Buffer.from(salt, "hex"), 210000, 32, "sha256");
-  const correct = timingSafeEqual(actual, Buffer.from(expected, "hex"));
-  if (!correct) {
-    attempts.set(ip, { count: existing && existing.until > now ? existing.count + 1 : 1, until: now + 900000 });
-    return res.status(401).json({ error: "كلمة المرور غير صحيحة." });
-  }
-  attempts.delete(ip);
-  const token = randomBytes(32).toString("base64url");
-  sessions.set(hashToken(token), now + SESSION_MS);
-  return res.json({ token, expiresIn: SESSION_MS / 1000 });
-});
+
+const b64urlJson = part => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+const normalizeShop = s => String(s || "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/\.myshopify\.com$/, "");
+
+function verifyShopifySessionToken(token) {
+  const secret = process.env.SHOPIFY_CLIENT_SECRET || "";
+  const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
+  if (!secret || !apiKey) throw new Error("server-misconfigured");
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("malformed");
+  const header = b64urlJson(parts[0]);
+  if (header.alg !== "HS256") throw new Error("bad-alg");
+  const expected = createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
+  const actual = Buffer.from(parts[2], "base64url");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("bad-signature");
+  const payload = b64urlJson(parts[1]);
+  const now = Math.floor(Date.now() / 1000);
+  const skew = 10;
+  if (typeof payload.exp !== "number" || payload.exp + skew < now) throw new Error("expired");
+  if (typeof payload.nbf === "number" && payload.nbf - skew > now) throw new Error("not-yet-valid");
+  const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!aud.includes(apiKey)) throw new Error("bad-audience");
+  const configuredShop = normalizeShop(process.env.SHOP_NAME);
+  if (configuredShop && normalizeShop(payload.dest) !== configuredShop) throw new Error("wrong-shop");
+  return payload;
+}
+
 function verifyDashboardSession(req, res, next) {
   const header = req.get("authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const key = token.length >= 32 && token.length <= 256 ? hashToken(token) : "";
-  const expiration = sessions.get(key);
-  if (!expiration || expiration <= Date.now()) {
-    if (expiration) sessions.delete(key);
-    return res.status(401).json({ error: "سجّل دخول بكلمة المرور علشان تشوف الأوردرات.", code: "DASHBOARD_LOGIN_REQUIRED" });
+  if (!token || token.length > 4096) {
+    return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED" });
   }
-  next();
+  try {
+    req.shopifySession = verifyShopifySessionToken(token);
+    next();
+  } catch (err) {
+    if (err.message === "server-misconfigured") {
+      return res.status(503).json({ error: "SHOPIFY_CLIENT_ID أو SHOPIFY_CLIENT_SECRET مش متظبطين على السيرفر." });
+    }
+    return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED" });
+  }
 }
-app.post("/api/logout", verifyDashboardSession, (req, res) => {
-  sessions.delete(hashToken((req.get("authorization") || "").slice(7)));
-  res.json({ ok: true });
-});
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, expiration] of sessions) if (expiration <= now) sessions.delete(key);
-  for (const [key, entry] of attempts) if (entry.until <= now) attempts.delete(key);
-}, 10 * 60 * 1000).unref();
 
 app.get("/", (req, res) => {
+  const shop = normalizeShop(process.env.SHOP_NAME);
+  res.set("Content-Security-Policy",
+    "frame-ancestors https://admin.shopify.com" + (shop ? ` https://${shop}.myshopify.com` : " https://*.myshopify.com") + ";");
   const apiKey = process.env.SHOPIFY_CLIENT_ID || "";
   const html = `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -128,7 +146,7 @@ app.get("/", (req, res) => {
 app.use(express.static(join(__dirname, "frontend/dist")));
 
 app.get("/api/orders", verifyDashboardSession, async (req, res) => {
-  const shop = (process.env.SHOP_NAME || "").replace(/\\.myshopify\\.com$/i, "");
+  const shop = normalizeShop(process.env.SHOP_NAME);
 
   if (!shop) {
     return res.status(400).json({ error: "Missing shop" });
@@ -137,11 +155,7 @@ app.get("/api/orders", verifyDashboardSession, async (req, res) => {
   try {
     const token = await getShopifyAccessToken(shop);
 
-    const TIMEZONE_OFFSET = process.env.TIMEZONE_OFFSET || "+03:00";
-    const today = new Date();
-    const dateStr = today.toLocaleDateString("en-CA", {
-      timeZone: "Africa/Cairo"
-    });
+    const dateStr = new Date().toLocaleDateString("en-CA", { timeZone: STORE_TZ });
 
     const fromStr = req.query.date_from || dateStr;
     const toStr = req.query.date_to || dateStr;
@@ -154,8 +168,9 @@ app.get("/api/orders", verifyDashboardSession, async (req, res) => {
     const days = Math.round((Date.parse(toStr) - Date.parse(fromStr)) / 86400000) + 1;
     if (days > 366) return res.status(400).json({ error: "أقصى مدة للبحث سنة واحدة." });
 
-    const minDate = `${fromStr}T00:00:00${TIMEZONE_OFFSET}`;
-    const maxDate = `${toStr}T23:59:59${TIMEZONE_OFFSET}`;
+    // Offsets are computed per date, so Egypt's summer time (+03:00) and winter time (+02:00) are both right.
+    const minDate = zonedIso(fromStr, "00:00:00");
+    const maxDate = zonedIso(toStr, "23:59:59");
 
     let allOrders = [];
     let url =
