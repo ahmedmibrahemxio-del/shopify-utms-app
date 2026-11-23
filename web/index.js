@@ -116,6 +116,7 @@ function verifyDashboardSession(req, res, next) {
   const header = req.get("authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!token || token.length > 4096) {
+    console.warn("[auth] rejected: no-token");
     return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED" });
   }
   try {
@@ -125,7 +126,13 @@ function verifyDashboardSession(req, res, next) {
     if (err.message === "server-misconfigured") {
       return res.status(503).json({ error: "SHOPIFY_CLIENT_ID أو SHOPIFY_CLIENT_SECRET مش متظبطين على السيرفر." });
     }
-    return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED" });
+    let claims = {};
+    try { claims = b64urlJson(token.split(".")[1]); } catch {}
+    console.warn("[auth] rejected:", err.message, JSON.stringify({
+      dest: claims.dest, audMatches: claims.aud === process.env.SHOPIFY_CLIENT_ID,
+      configuredShop: normalizeShop(process.env.SHOP_NAME), expInSec: claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : null
+    }));
+    return res.status(401).json({ error: "افتح الداشبورد من جوه Shopify Admin.", code: "SHOPIFY_SESSION_REQUIRED", reason: err.message });
   }
 }
 

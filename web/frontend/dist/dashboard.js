@@ -66,7 +66,8 @@
   const embedded = (() => { try { return window.top !== window.self; } catch { return true; } })();
   async function sessionToken() {
     if (!embedded || !window.shopify || typeof window.shopify.idToken !== "function") {
-      throw Object.assign(new Error("not-embedded"), { fatal: true });
+      console.warn("[UTM Track] not embedded", { embedded, hasShopify: !!window.shopify });
+      throw Object.assign(new Error(embedded ? "no-app-bridge" : "not-embedded"), { fatal: true });
     }
     return Promise.race([
       window.shopify.idToken(),
@@ -87,12 +88,12 @@
       const type = res.headers.get("content-type") || "";
       if (!type.includes("application/json")) throw new Error("الخادم رجّع استجابة غير متوقعة، جرّب تاني.");
       const json = await res.json();
-      if (res.status === 401) throw Object.assign(new Error("not-embedded"), { fatal: true });
+      if (res.status === 401) throw Object.assign(new Error("server:" + (json.reason || "401")), { fatal: true });
       if (!res.ok) throw new Error(json.error || "فشل في جلب الأوردرات");
       state.data = json; state.refreshedAt = new Date(); state.page = 0;
       state.selectedProduct = null; state.selectedOrder = null;
     } catch (err) {
-      if (err.fatal) state.fatal = "not-embedded";
+      if (err.fatal) state.fatal = err.message;
       else state.error = err.message || "حصل خطأ";
     } finally {
       state.busy = false; render();
@@ -301,7 +302,8 @@
     if (!root) return;
     if (state.fatal) {
       root.innerHTML = '<div class="center"><div class="notice"><div class="logo">UT</div><h2>افتح الداشبورد من Shopify Admin</h2>' +
-        "<p>الداشبورد بيفتح على طول من غير باسورد، بس من جوه لوحة تحكم شوبيفاي: Apps ← UTM Track.</p></div></div>";
+        "<p>الداشبورد بيفتح على طول من غير باسورد، بس من جوه لوحة تحكم شوبيفاي: Apps ← UTM Track.</p>" +
+        '<code class="diag">' + esc(state.fatal) + "</code></div></div>";
       return;
     }
     const tabs = Object.keys(VIEWS).map((k) => '<button class="tab' + (state.view === k ? " on" : "") + '" data-view="' + k + '">' + VIEWS[k] + "</button>").join("");

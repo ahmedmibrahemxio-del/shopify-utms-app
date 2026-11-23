@@ -198,3 +198,4 @@ tr.clickable:hover td { background: #fafbfc; }
   .kpi-value { font-size: 21px; }
   .toolbar select { flex: 1; max-width: none; }
 }
+.diag{font:12px ui-monospace,monospace;color:var(--muted);direction:ltr}
